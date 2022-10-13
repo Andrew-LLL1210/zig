@@ -18,7 +18,7 @@ const target_util = @import("target.zig");
 
 comptime {
     assert(builtin.link_libc);
-    assert(build_options.is_stage1);
+    assert(build_options.have_stage1);
     assert(build_options.have_llvm);
     if (!builtin.is_test) {
         @export(main, .{ .name = "main" });
@@ -40,10 +40,18 @@ pub fn main(argc: c_int, argv: [*][*:0]u8) callconv(.C) c_int {
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
 
-    const args = arena.alloc([]const u8, @intCast(usize, argc)) catch fatal("{s}", .{"OutOfMemory"});
-    for (args) |*arg, i| {
-        arg.* = mem.sliceTo(argv[i], 0);
-    }
+    const args: []const []const u8 = args: {
+        if (builtin.os.tag == .windows) {
+            break :args std.process.argsAlloc(arena) catch fatal("{s}", .{"OutOfMemory"});
+        } else {
+            const args = arena.alloc([]const u8, @intCast(usize, argc)) catch fatal("{s}", .{"OutOfMemory"});
+            for (args) |*arg, i| {
+                arg.* = mem.sliceTo(argv[i], 0);
+            }
+            break :args args;
+        }
+    };
+
     if (builtin.mode == .Debug) {
         stage2.mainArgs(gpa, arena, args) catch unreachable;
     } else {
@@ -416,7 +424,7 @@ export fn stage2_add_link_lib(
     const target = comp.getTarget();
     const is_libc = target_util.is_libc_lib_name(target, lib_name);
     if (is_libc) {
-        if (!comp.bin_file.options.link_libc) {
+        if (!comp.bin_file.options.link_libc and !comp.bin_file.options.parent_compilation_link_libc) {
             return "dependency on libc must be explicitly specified in the build command";
         }
         return null;

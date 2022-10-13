@@ -199,8 +199,7 @@ fn renderExpression(gpa: Allocator, ais: *Ais, tree: Ast, node: Ast.Node.Index, 
             return renderSpace(ais, tree, token_index, lexeme.len, space);
         },
 
-        .integer_literal,
-        .float_literal,
+        .number_literal,
         .char_literal,
         .unreachable_literal,
         .anyframe_literal,
@@ -686,8 +685,8 @@ fn renderExpression(gpa: Allocator, ais: *Ais, tree: Ast, node: Ast.Node.Index, 
             return renderToken(ais, tree, tree.lastToken(node), space); // rbrace
         },
 
-        .switch_case_one => return renderSwitchCase(gpa, ais, tree, tree.switchCaseOne(node), space),
-        .switch_case => return renderSwitchCase(gpa, ais, tree, tree.switchCase(node), space),
+        .switch_case_one, .switch_case_inline_one => return renderSwitchCase(gpa, ais, tree, tree.switchCaseOne(node), space),
+        .switch_case, .switch_case_inline => return renderSwitchCase(gpa, ais, tree, tree.switchCase(node), space),
 
         .while_simple => return renderWhile(gpa, ais, tree, tree.whileSimple(node), space),
         .while_cont => return renderWhile(gpa, ais, tree, tree.whileCont(node), space),
@@ -1510,6 +1509,11 @@ fn renderSwitchCase(
         break :blk hasComment(tree, tree.firstToken(switch_case.ast.values[0]), switch_case.ast.arrow_token);
     };
 
+    // render inline keyword
+    if (switch_case.inline_token) |some| {
+        try renderToken(ais, tree, some, .space);
+    }
+
     // Render everything before the arrow
     if (switch_case.ast.values.len == 0) {
         try renderToken(ais, tree, switch_case.ast.arrow_token - 1, .space); // else keyword
@@ -1537,13 +1541,17 @@ fn renderSwitchCase(
 
     if (switch_case.payload_token) |payload_token| {
         try renderToken(ais, tree, payload_token - 1, .none); // pipe
+        const ident = payload_token + @boolToInt(token_tags[payload_token] == .asterisk);
         if (token_tags[payload_token] == .asterisk) {
             try renderToken(ais, tree, payload_token, .none); // asterisk
-            try renderToken(ais, tree, payload_token + 1, .none); // identifier
-            try renderToken(ais, tree, payload_token + 2, pre_target_space); // pipe
+        }
+        try renderToken(ais, tree, ident, .none); // identifier
+        if (token_tags[ident + 1] == .comma) {
+            try renderToken(ais, tree, ident + 1, .space); // ,
+            try renderToken(ais, tree, ident + 2, .none); // identifier
+            try renderToken(ais, tree, ident + 3, pre_target_space); // pipe
         } else {
-            try renderToken(ais, tree, payload_token, .none); // identifier
-            try renderToken(ais, tree, payload_token + 1, pre_target_space); // pipe
+            try renderToken(ais, tree, ident + 1, pre_target_space); // pipe
         }
     }
 
@@ -1933,12 +1941,15 @@ fn renderContainerDecl(
             break :one_line;
         }
 
-        // 2. A member of the container has a doc comment.
+        // 2. The container has a container comment.
+        if (token_tags[lbrace + 1] == .container_doc_comment) break :one_line;
+
+        // 3. A member of the container has a doc comment.
         for (token_tags[lbrace + 1 .. rbrace - 1]) |tag| {
             if (tag == .doc_comment) break :one_line;
         }
 
-        // 3. The container has non-field members.
+        // 4. The container has non-field members.
         for (container_decl.ast.members) |member| {
             if (!node_tags[member].isContainerField()) break :one_line;
         }
@@ -2114,9 +2125,19 @@ fn renderAsm(
                 return renderToken(ais, tree, tok_i + 1, space);
             },
             .comma => {
-                try renderToken(ais, tree, tok_i, .none);
-                try renderToken(ais, tree, tok_i + 1, .space);
-                tok_i += 2;
+                switch (token_tags[tok_i + 2]) {
+                    .r_paren => {
+                        ais.setIndentDelta(indent_delta);
+                        ais.popIndent();
+                        try renderToken(ais, tree, tok_i, .newline);
+                        return renderToken(ais, tree, tok_i + 2, space);
+                    },
+                    else => {
+                        try renderToken(ais, tree, tok_i, .none);
+                        try renderToken(ais, tree, tok_i + 1, .space);
+                        tok_i += 2;
+                    },
+                }
             },
             else => unreachable,
         }
@@ -2348,7 +2369,7 @@ fn renderSpace(ais: *Ais, tree: Ast, token_index: Ast.TokenIndex, lexeme_len: us
     }
 }
 
-/// Returns true if there exists a comment between any of the tokens from
+/// Returns true if there exists a line comment between any of the tokens from
 /// `start_token` to `end_token`. This is used to determine if e.g. a
 /// fn_proto should be wrapped and have a trailing comma inserted even if
 /// there is none in the source.

@@ -20,7 +20,7 @@ pub const Tokenizer = tokenizer.Tokenizer;
 /// If linking gnu libc (glibc), the `ok` value will be true if the target
 /// version is greater than or equal to `glibc_version`.
 /// If linking a libc other than these, returns `false`.
-pub fn versionCheck(glibc_version: std.builtin.Version) type {
+pub fn versionCheck(comptime glibc_version: std.builtin.Version) type {
     return struct {
         pub const ok = blk: {
             if (!builtin.link_libc) break :blk false;
@@ -241,11 +241,8 @@ pub extern "c" fn utimes(path: [*:0]const u8, times: *[2]c.timeval) c_int;
 pub extern "c" fn utimensat(dirfd: c.fd_t, pathname: [*:0]const u8, times: *[2]c.timespec, flags: u32) c_int;
 pub extern "c" fn futimens(fd: c.fd_t, times: *const [2]c.timespec) c_int;
 
+const PThreadStartFn = std.meta.FnPtr(fn (?*anyopaque) callconv(.C) ?*anyopaque);
 pub extern "c" fn pthread_create(noalias newthread: *pthread_t, noalias attr: ?*const c.pthread_attr_t, start_routine: PThreadStartFn, noalias arg: ?*anyopaque) c.E;
-const PThreadStartFn = if (builtin.zig_backend == .stage1)
-    fn (?*anyopaque) callconv(.C) ?*anyopaque
-else
-    *const fn (?*anyopaque) callconv(.C) ?*anyopaque;
 pub extern "c" fn pthread_attr_init(attr: *c.pthread_attr_t) c.E;
 pub extern "c" fn pthread_attr_setstack(attr: *c.pthread_attr_t, stackaddr: *anyopaque, stacksize: usize) c.E;
 pub extern "c" fn pthread_attr_setstacksize(attr: *c.pthread_attr_t, stacksize: usize) c.E;
@@ -254,16 +251,14 @@ pub extern "c" fn pthread_attr_destroy(attr: *c.pthread_attr_t) c.E;
 pub extern "c" fn pthread_self() pthread_t;
 pub extern "c" fn pthread_join(thread: pthread_t, arg_return: ?*?*anyopaque) c.E;
 pub extern "c" fn pthread_detach(thread: pthread_t) c.E;
+const PThreadForkFn = std.meta.FnPtr(fn () callconv(.C) void);
 pub extern "c" fn pthread_atfork(
     prepare: ?PThreadForkFn,
     parent: ?PThreadForkFn,
     child: ?PThreadForkFn,
 ) c_int;
-const PThreadForkFn = if (builtin.zig_backend == .stage1)
-    fn () callconv(.C) void
-else
-    *const fn () callconv(.C) void;
-pub extern "c" fn pthread_key_create(key: *c.pthread_key_t, destructor: ?fn (value: *anyopaque) callconv(.C) void) c.E;
+const PThreadKeyCreateFn = std.meta.FnPtr(fn (value: *anyopaque) callconv(.C) void);
+pub extern "c" fn pthread_key_create(key: *c.pthread_key_t, destructor: ?PThreadKeyCreateFn) c.E;
 pub extern "c" fn pthread_key_delete(key: c.pthread_key_t) c.E;
 pub extern "c" fn pthread_getspecific(key: c.pthread_key_t) ?*anyopaque;
 pub extern "c" fn pthread_setspecific(key: c.pthread_key_t, value: ?*anyopaque) c_int;

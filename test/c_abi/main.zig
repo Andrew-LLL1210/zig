@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const print = std.debug.print;
 const expect = std.testing.expect;
 
@@ -89,6 +90,7 @@ export fn zig_struct_u128(a: U128) void {
 
 extern fn c_f32(f32) void;
 extern fn c_f64(f64) void;
+extern fn c_long_double(c_longdouble) void;
 
 // On windows x64, the first 4 are passed via registers, others on the stack.
 extern fn c_five_floats(f32, f32, f32, f32, f32) void;
@@ -107,11 +109,20 @@ test "C ABI floats" {
     c_five_floats(1.0, 2.0, 3.0, 4.0, 5.0);
 }
 
+test "C ABI long double" {
+    if (!builtin.cpu.arch.isWasm() and !builtin.cpu.arch.isAARCH64()) return error.SkipZigTest;
+    c_long_double(12.34);
+}
+
 export fn zig_f32(x: f32) void {
     expect(x == 12.34) catch @panic("test failure: zig_f32");
 }
 export fn zig_f64(x: f64) void {
     expect(x == 56.78) catch @panic("test failure: zig_f64");
+}
+export fn zig_longdouble(x: c_longdouble) void {
+    if (!builtin.cpu.arch.isWasm()) return; // waiting for #1481
+    expect(x == 12.34) catch @panic("test failure: zig_longdouble");
 }
 
 extern fn c_ptr(*anyopaque) void;
@@ -132,6 +143,101 @@ test "C ABI bool" {
 
 export fn zig_bool(x: bool) void {
     expect(x) catch @panic("test failure: zig_bool");
+}
+
+// TODO: Replace these with the correct types once we resolve
+//       https://github.com/ziglang/zig/issues/8465
+//
+// For now, we have no way of referring to the _Complex C types from Zig,
+// so our ABI is unavoidably broken on some platforms (such as i386)
+const ComplexFloat = extern struct {
+    real: f32,
+    imag: f32,
+};
+const ComplexDouble = extern struct {
+    real: f64,
+    imag: f64,
+};
+
+// Note: These two functions match the signature of __mulsc3 and __muldc3 in compiler-rt (and libgcc)
+extern fn c_cmultf_comp(a_r: f32, a_i: f32, b_r: f32, b_i: f32) ComplexFloat;
+extern fn c_cmultd_comp(a_r: f64, a_i: f64, b_r: f64, b_i: f64) ComplexDouble;
+
+extern fn c_cmultf(a: ComplexFloat, b: ComplexFloat) ComplexFloat;
+extern fn c_cmultd(a: ComplexDouble, b: ComplexDouble) ComplexDouble;
+
+test "C ABI complex float" {
+    if (true) return error.SkipZigTest; // See https://github.com/ziglang/zig/issues/8465
+
+    const a = ComplexFloat{ .real = 1.25, .imag = 2.6 };
+    const b = ComplexFloat{ .real = 11.3, .imag = -1.5 };
+
+    const z = c_cmultf(a, b);
+    expect(z.real == 1.5) catch @panic("test failure: zig_complex_float 1");
+    expect(z.imag == 13.5) catch @panic("test failure: zig_complex_float 2");
+}
+
+test "C ABI complex float by component" {
+    const a = ComplexFloat{ .real = 1.25, .imag = 2.6 };
+    const b = ComplexFloat{ .real = 11.3, .imag = -1.5 };
+
+    const z2 = c_cmultf_comp(a.real, a.imag, b.real, b.imag);
+    expect(z2.real == 1.5) catch @panic("test failure: zig_complex_float 3");
+    expect(z2.imag == 13.5) catch @panic("test failure: zig_complex_float 4");
+}
+
+test "C ABI complex double" {
+    const a = ComplexDouble{ .real = 1.25, .imag = 2.6 };
+    const b = ComplexDouble{ .real = 11.3, .imag = -1.5 };
+
+    const z = c_cmultd(a, b);
+    expect(z.real == 1.5) catch @panic("test failure: zig_complex_double 1");
+    expect(z.imag == 13.5) catch @panic("test failure: zig_complex_double 2");
+}
+
+test "C ABI complex double by component" {
+    const a = ComplexDouble{ .real = 1.25, .imag = 2.6 };
+    const b = ComplexDouble{ .real = 11.3, .imag = -1.5 };
+
+    const z = c_cmultd_comp(a.real, a.imag, b.real, b.imag);
+    expect(z.real == 1.5) catch @panic("test failure: zig_complex_double 3");
+    expect(z.imag == 13.5) catch @panic("test failure: zig_complex_double 4");
+}
+
+export fn zig_cmultf(a: ComplexFloat, b: ComplexFloat) ComplexFloat {
+    expect(a.real == 1.25) catch @panic("test failure: zig_cmultf 1");
+    expect(a.imag == 2.6) catch @panic("test failure: zig_cmultf 2");
+    expect(b.real == 11.3) catch @panic("test failure: zig_cmultf 3");
+    expect(b.imag == -1.5) catch @panic("test failure: zig_cmultf 4");
+
+    return .{ .real = 1.5, .imag = 13.5 };
+}
+
+export fn zig_cmultd(a: ComplexDouble, b: ComplexDouble) ComplexDouble {
+    expect(a.real == 1.25) catch @panic("test failure: zig_cmultd 1");
+    expect(a.imag == 2.6) catch @panic("test failure: zig_cmultd 2");
+    expect(b.real == 11.3) catch @panic("test failure: zig_cmultd 3");
+    expect(b.imag == -1.5) catch @panic("test failure: zig_cmultd 4");
+
+    return .{ .real = 1.5, .imag = 13.5 };
+}
+
+export fn zig_cmultf_comp(a_r: f32, a_i: f32, b_r: f32, b_i: f32) ComplexFloat {
+    expect(a_r == 1.25) catch @panic("test failure: zig_cmultf_comp 1");
+    expect(a_i == 2.6) catch @panic("test failure: zig_cmultf_comp 2");
+    expect(b_r == 11.3) catch @panic("test failure: zig_cmultf_comp 3");
+    expect(b_i == -1.5) catch @panic("test failure: zig_cmultf_comp 4");
+
+    return .{ .real = 1.5, .imag = 13.5 };
+}
+
+export fn zig_cmultd_comp(a_r: f64, a_i: f64, b_r: f64, b_i: f64) ComplexDouble {
+    expect(a_r == 1.25) catch @panic("test failure: zig_cmultd_comp 1");
+    expect(a_i == 2.6) catch @panic("test failure: zig_cmultd_comp 2");
+    expect(b_r == 11.3) catch @panic("test failure: zig_cmultd_comp 3");
+    expect(b_i == -1.5) catch @panic("test failure: zig_cmultd_comp 4");
+
+    return .{ .real = 1.5, .imag = 13.5 };
 }
 
 const BigStruct = extern struct {
@@ -252,37 +358,30 @@ const SmallPackedStruct = packed struct {
     b: u2,
     c: u2,
     d: u2,
-    e: bool,
 };
-const c_small_packed_struct: fn (SmallPackedStruct) callconv(.C) void = @compileError("TODO: #1481");
+extern fn c_small_packed_struct(SmallPackedStruct) void;
 extern fn c_ret_small_packed_struct() SmallPackedStruct;
 
-// waiting on #1481
-//export fn zig_small_packed_struct(x: SmallPackedStruct) void {
-//    expect(x.a == 0) catch @panic("test failure");
-//    expect(x.b == 1) catch @panic("test failure");
-//    expect(x.c == 2) catch @panic("test failure");
-//    expect(x.d == 3) catch @panic("test failure");
-//    expect(x.e) catch @panic("test failure");
-//}
+export fn zig_small_packed_struct(x: SmallPackedStruct) void {
+    expect(x.a == 0) catch @panic("test failure");
+    expect(x.b == 1) catch @panic("test failure");
+    expect(x.c == 2) catch @panic("test failure");
+    expect(x.d == 3) catch @panic("test failure");
+}
 
 test "C ABI small packed struct" {
-    var s = SmallPackedStruct{ .a = 0, .b = 1, .c = 2, .d = 3, .e = true };
-    _ = s; //c_small_packed_struct(s); // waiting on #1481
+    var s = SmallPackedStruct{ .a = 0, .b = 1, .c = 2, .d = 3 };
+    c_small_packed_struct(s);
     var s2 = c_ret_small_packed_struct();
     try expect(s2.a == 0);
     try expect(s2.b == 1);
     try expect(s2.c == 2);
     try expect(s2.d == 3);
-    try expect(s2.e);
 }
 
 const BigPackedStruct = packed struct {
     a: u64,
     b: u64,
-    c: u64,
-    d: u64,
-    e: u8,
 };
 extern fn c_big_packed_struct(BigPackedStruct) void;
 extern fn c_ret_big_packed_struct() BigPackedStruct;
@@ -290,20 +389,14 @@ extern fn c_ret_big_packed_struct() BigPackedStruct;
 export fn zig_big_packed_struct(x: BigPackedStruct) void {
     expect(x.a == 1) catch @panic("test failure");
     expect(x.b == 2) catch @panic("test failure");
-    expect(x.c == 3) catch @panic("test failure");
-    expect(x.d == 4) catch @panic("test failure");
-    expect(x.e == 5) catch @panic("test failure");
 }
 
 test "C ABI big packed struct" {
-    var s = BigPackedStruct{ .a = 1, .b = 2, .c = 3, .d = 4, .e = 5 };
+    var s = BigPackedStruct{ .a = 1, .b = 2 };
     c_big_packed_struct(s);
     var s2 = c_ret_big_packed_struct();
     try expect(s2.a == 1);
     try expect(s2.b == 2);
-    try expect(s2.c == 3);
-    try expect(s2.d == 4);
-    try expect(s2.e == 5);
 }
 
 const SplitStructInt = extern struct {
@@ -356,6 +449,9 @@ export fn zig_split_struct_mixed(x: SplitStructMixed) void {
 }
 
 extern fn c_big_struct_both(BigStruct) BigStruct;
+
+extern fn c_multiple_struct_ints(Rect, Rect) void;
+extern fn c_multiple_struct_floats(FloatRect, FloatRect) void;
 
 test "C ABI sret and byval together" {
     var s = BigStruct{
@@ -423,6 +519,74 @@ test "C ABI structs of floats as parameter" {
         .q = 55,
     };
     c_big_struct_floats(v5);
+}
+
+const Rect = extern struct {
+    left: u32,
+    right: u32,
+    top: u32,
+    bottom: u32,
+};
+
+export fn zig_multiple_struct_ints(x: Rect, y: Rect) void {
+    expect(x.left == 1) catch @panic("test failure");
+    expect(x.right == 21) catch @panic("test failure");
+    expect(x.top == 16) catch @panic("test failure");
+    expect(x.bottom == 4) catch @panic("test failure");
+    expect(y.left == 178) catch @panic("test failure");
+    expect(y.right == 189) catch @panic("test failure");
+    expect(y.top == 21) catch @panic("test failure");
+    expect(y.bottom == 15) catch @panic("test failure");
+}
+
+test "C ABI structs of ints as multiple parameters" {
+    var r1 = Rect{
+        .left = 1,
+        .right = 21,
+        .top = 16,
+        .bottom = 4,
+    };
+    var r2 = Rect{
+        .left = 178,
+        .right = 189,
+        .top = 21,
+        .bottom = 15,
+    };
+    c_multiple_struct_ints(r1, r2);
+}
+
+const FloatRect = extern struct {
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+};
+
+export fn zig_multiple_struct_floats(x: FloatRect, y: FloatRect) void {
+    expect(x.left == 1) catch @panic("test failure");
+    expect(x.right == 21) catch @panic("test failure");
+    expect(x.top == 16) catch @panic("test failure");
+    expect(x.bottom == 4) catch @panic("test failure");
+    expect(y.left == 178) catch @panic("test failure");
+    expect(y.right == 189) catch @panic("test failure");
+    expect(y.top == 21) catch @panic("test failure");
+    expect(y.bottom == 15) catch @panic("test failure");
+}
+
+test "C ABI structs of floats as multiple parameters" {
+    var r1 = FloatRect{
+        .left = 1,
+        .right = 21,
+        .top = 16,
+        .bottom = 4,
+    };
+    var r2 = FloatRect{
+        .left = 178,
+        .right = 189,
+        .top = 21,
+        .bottom = 15,
+    };
+    c_multiple_struct_floats(r1, r2);
 }
 
 export fn zig_ret_bool() bool {

@@ -5374,10 +5374,8 @@ static Stage1ZirInst *astgen_builtin_fn_call(Stage1AstGen *ag, Scope *scope, Ast
                 if (arg0_value == ag->codegen->invalid_inst_src)
                     return arg0_value;
 
-                AstNode *arg1_node = node->data.fn_call_expr.params.at(1);
-                Stage1ZirInst *arg1_value = astgen_node(ag, arg1_node, scope);
-                if (arg1_value == ag->codegen->invalid_inst_src)
-                    return arg1_value;
+                Stage1ZirInst *arg1_value = arg0_value;
+                arg0_value = ir_build_typeof_1(ag, scope, arg0_node, arg1_value);
 
                 Stage1ZirInst *result;
                 switch (builtin_fn->id) {
@@ -6988,6 +6986,12 @@ static bool astgen_switch_prong_expr(Stage1AstGen *ag, Scope *scope, AstNode *sw
 {
     assert(switch_node->type == NodeTypeSwitchExpr);
     assert(prong_node->type == NodeTypeSwitchProng);
+
+    if (prong_node->data.switch_prong.is_inline) {
+        exec_add_error_node(ag->codegen, ag->exec, prong_node,
+                buf_sprintf("inline switch cases not supported by stage1"));
+        return ag->codegen->invalid_inst_src;
+    }
 
     AstNode *expr_node = prong_node->data.switch_prong.expr;
     AstNode *var_symbol_node = prong_node->data.switch_prong.var_symbol;

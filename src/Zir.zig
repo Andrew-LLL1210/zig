@@ -43,7 +43,11 @@ pub const Header = extern struct {
     instructions_len: u32,
     string_bytes_len: u32,
     extra_len: u32,
-
+    /// We could leave this as padding, however it triggers a Valgrind warning because
+    /// we read and write undefined bytes to the file system. This is harmless, but
+    /// it's essentially free to have a zero field here and makes the warning go away,
+    /// making it more likely that following Valgrind warnings will be taken seriously.
+    unused: u32 = 0,
     stat_inode: std.fs.File.INode,
     stat_size: u64,
     stat_mtime: i128,
@@ -238,6 +242,8 @@ pub const Inst = struct {
         /// Type coercion to the function's return type.
         /// Uses the `pl_node` field. Payload is `As`. AST node could be many things.
         as_node,
+        /// Same as `as_node` but ignores runtime to comptime int error.
+        as_shift_operand,
         /// Bitwise AND. `&`
         bit_and,
         /// Reinterpret the memory representation of a value as a different type.
@@ -281,7 +287,7 @@ pub const Inst = struct {
         /// Uses the `break` union field.
         break_inline,
         /// Checks that comptime control flow does not happen inside a runtime block.
-        /// Uses the `node` union field.
+        /// Uses the `un_node` union field.
         check_comptime_control_flow,
         /// Function call.
         /// Uses the `pl_node` union field with payload `Call`.
@@ -396,6 +402,8 @@ pub const Inst = struct {
         /// Emits a compile error if an error is ignored.
         /// Uses the `un_node` field.
         ensure_result_non_error,
+        /// Emits a compile error error union payload is not void.
+        ensure_err_union_payload_void,
         /// Create a `E!T` type.
         /// Uses the `pl_node` field with `Bin` payload.
         error_union_type,
@@ -623,20 +631,10 @@ pub const Inst = struct {
         /// No safety checks.
         /// Uses the `un_node` field.
         optional_payload_unsafe_ptr,
-        /// E!T => T with safety.
-        /// Given an error union value, returns the payload value, with a safety check
-        /// that the value is not an error. Used for catch, if, and while.
-        /// Uses the `un_node` field.
-        err_union_payload_safe,
         /// E!T => T without safety.
         /// Given an error union value, returns the payload value. No safety checks.
         /// Uses the `un_node` field.
         err_union_payload_unsafe,
-        /// *E!T => *T with safety.
-        /// Given a pointer to an error union value, returns a pointer to the payload value,
-        /// with a safety check that the value is not an error. Used for catch, if, and while.
-        /// Uses the `un_node` field.
-        err_union_payload_safe_ptr,
         /// *E!T => *T without safety.
         /// Given a pointer to a error union value, returns a pointer to the payload value.
         /// No safety checks.
@@ -650,9 +648,6 @@ pub const Inst = struct {
         /// Given a pointer to an error union value, returns the error code. No safety checks.
         /// Uses the `un_node` field.
         err_union_code_ptr,
-        /// Takes a *E!T and raises a compiler error if T != void
-        /// Uses the `un_tok` field.
-        ensure_err_payload_void,
         /// An enum literal. Uses the `str_tok` union field.
         enum_literal,
         /// A switch expression. Uses the `pl_node` union field.
@@ -687,6 +682,9 @@ pub const Inst = struct {
         /// Result is a pointer to the value.
         /// Uses the `switch_capture` field.
         switch_capture_multi_ref,
+        /// Produces the capture value for an inline switch prong tag capture.
+        /// Uses the `un_tok` field.
+        switch_capture_tag,
         /// Given a
         ///   *A returns *A
         ///   *E!A returns *A
@@ -894,12 +892,6 @@ pub const Inst = struct {
         /// Implements the `@offsetOf` builtin.
         /// Uses the `pl_node` union field with payload `Bin`.
         offset_of,
-        /// Implements the `@cmpxchgStrong` builtin.
-        /// Uses the `pl_node` union field with payload `Cmpxchg`.
-        cmpxchg_strong,
-        /// Implements the `@cmpxchgWeak` builtin.
-        /// Uses the `pl_node` union field with payload `Cmpxchg`.
-        cmpxchg_weak,
         /// Implements the `@splat` builtin.
         /// Uses the `pl_node` union field with payload `Bin`.
         splat,
@@ -938,9 +930,6 @@ pub const Inst = struct {
         /// Implements the `@maximum` builtin.
         /// Uses the `pl_node` union field with payload `Bin`
         maximum,
-        /// Implements the `@asyncCall` builtin.
-        /// Uses the `pl_node` union field with payload `AsyncCall`.
-        builtin_async_call,
         /// Implements the `@cImport` builtin.
         /// Uses the `pl_node` union field with payload `Block`.
         c_import,
@@ -992,6 +981,13 @@ pub const Inst = struct {
         /// closure_capture instruction ref.
         closure_get,
 
+        /// A defer statement.
+        /// Uses the `defer` union field.
+        @"defer",
+        /// An errdefer statement with a code.
+        /// Uses the `err_defer_code` union field.
+        defer_err_code,
+
         /// The ZIR instruction tag is one of the `Extended` ones.
         /// Uses the `extended` union field.
         extended,
@@ -1025,6 +1021,7 @@ pub const Inst = struct {
                 .anyframe_type,
                 .as,
                 .as_node,
+                .as_shift_operand,
                 .bit_and,
                 .bitcast,
                 .bit_or,
@@ -1062,6 +1059,7 @@ pub const Inst = struct {
                 .elem_val_node,
                 .ensure_result_used,
                 .ensure_result_non_error,
+                .ensure_err_union_payload_void,
                 .@"export",
                 .export_value,
                 .field_ptr,
@@ -1109,15 +1107,12 @@ pub const Inst = struct {
                 .optional_payload_unsafe,
                 .optional_payload_safe_ptr,
                 .optional_payload_unsafe_ptr,
-                .err_union_payload_safe,
                 .err_union_payload_unsafe,
-                .err_union_payload_safe_ptr,
                 .err_union_payload_unsafe_ptr,
                 .err_union_code,
                 .err_union_code_ptr,
                 .ptr_type,
                 .overflow_arithmetic_ptr,
-                .ensure_err_payload_void,
                 .enum_literal,
                 .merge_error_sets,
                 .error_union_type,
@@ -1135,6 +1130,7 @@ pub const Inst = struct {
                 .switch_capture_ref,
                 .switch_capture_multi,
                 .switch_capture_multi_ref,
+                .switch_capture_tag,
                 .switch_block,
                 .switch_cond,
                 .switch_cond_ref,
@@ -1212,8 +1208,6 @@ pub const Inst = struct {
                 .shr_exact,
                 .bit_offset_of,
                 .offset_of,
-                .cmpxchg_strong,
-                .cmpxchg_weak,
                 .splat,
                 .reduce,
                 .shuffle,
@@ -1227,7 +1221,6 @@ pub const Inst = struct {
                 .memcpy,
                 .memset,
                 .minimum,
-                .builtin_async_call,
                 .c_import,
                 .@"resume",
                 .@"await",
@@ -1241,6 +1234,8 @@ pub const Inst = struct {
                 .try_ptr,
                 //.try_inline,
                 //.try_ptr_inline,
+                .@"defer",
+                .defer_err_code,
                 => false,
 
                 .@"break",
@@ -1286,7 +1281,7 @@ pub const Inst = struct {
                 .dbg_block_end,
                 .ensure_result_used,
                 .ensure_result_non_error,
-                .ensure_err_payload_void,
+                .ensure_err_union_payload_void,
                 .set_eval_branch_quota,
                 .atomic_store,
                 .store,
@@ -1308,6 +1303,8 @@ pub const Inst = struct {
                 .memcpy,
                 .memset,
                 .check_comptime_control_flow,
+                .@"defer",
+                .defer_err_code,
                 => true,
 
                 .param,
@@ -1335,6 +1332,7 @@ pub const Inst = struct {
                 .anyframe_type,
                 .as,
                 .as_node,
+                .as_shift_operand,
                 .bit_and,
                 .bitcast,
                 .bit_or,
@@ -1406,9 +1404,7 @@ pub const Inst = struct {
                 .optional_payload_unsafe,
                 .optional_payload_safe_ptr,
                 .optional_payload_unsafe_ptr,
-                .err_union_payload_safe,
                 .err_union_payload_unsafe,
-                .err_union_payload_safe_ptr,
                 .err_union_payload_unsafe_ptr,
                 .err_union_code,
                 .err_union_code_ptr,
@@ -1429,6 +1425,7 @@ pub const Inst = struct {
                 .switch_capture_ref,
                 .switch_capture_multi,
                 .switch_capture_multi_ref,
+                .switch_capture_tag,
                 .switch_block,
                 .switch_cond,
                 .switch_cond_ref,
@@ -1497,8 +1494,6 @@ pub const Inst = struct {
                 .shr_exact,
                 .bit_offset_of,
                 .offset_of,
-                .cmpxchg_strong,
-                .cmpxchg_weak,
                 .splat,
                 .reduce,
                 .shuffle,
@@ -1509,7 +1504,6 @@ pub const Inst = struct {
                 .field_parent_ptr,
                 .maximum,
                 .minimum,
-                .builtin_async_call,
                 .c_import,
                 .@"resume",
                 .@"await",
@@ -1573,6 +1567,7 @@ pub const Inst = struct {
                 .anyframe_type = .un_node,
                 .as = .bin,
                 .as_node = .pl_node,
+                .as_shift_operand = .pl_node,
                 .bit_and = .pl_node,
                 .bitcast = .pl_node,
                 .bit_not = .un_node,
@@ -1585,7 +1580,7 @@ pub const Inst = struct {
                 .bool_br_or = .bool_br,
                 .@"break" = .@"break",
                 .break_inline = .@"break",
-                .check_comptime_control_flow = .node,
+                .check_comptime_control_flow = .un_node,
                 .call = .pl_node,
                 .cmp_lt = .pl_node,
                 .cmp_lte = .pl_node,
@@ -1619,6 +1614,7 @@ pub const Inst = struct {
                 .elem_val_node = .pl_node,
                 .ensure_result_used = .un_node,
                 .ensure_result_non_error = .un_node,
+                .ensure_err_union_payload_void = .un_node,
                 .error_union_type = .pl_node,
                 .error_value = .str_tok,
                 .@"export" = .pl_node,
@@ -1677,13 +1673,10 @@ pub const Inst = struct {
                 .optional_payload_unsafe = .un_node,
                 .optional_payload_safe_ptr = .un_node,
                 .optional_payload_unsafe_ptr = .un_node,
-                .err_union_payload_safe = .un_node,
                 .err_union_payload_unsafe = .un_node,
-                .err_union_payload_safe_ptr = .un_node,
                 .err_union_payload_unsafe_ptr = .un_node,
                 .err_union_code = .un_node,
                 .err_union_code_ptr = .un_node,
-                .ensure_err_payload_void = .un_tok,
                 .enum_literal = .str_tok,
                 .switch_block = .pl_node,
                 .switch_cond = .un_node,
@@ -1692,6 +1685,7 @@ pub const Inst = struct {
                 .switch_capture_ref = .switch_capture,
                 .switch_capture_multi = .switch_capture,
                 .switch_capture_multi_ref = .switch_capture,
+                .switch_capture_tag = .un_tok,
                 .array_base_ptr = .un_node,
                 .field_base_ptr = .un_node,
                 .validate_array_init_ty = .pl_node,
@@ -1782,8 +1776,6 @@ pub const Inst = struct {
 
                 .bit_offset_of = .pl_node,
                 .offset_of = .pl_node,
-                .cmpxchg_strong = .pl_node,
-                .cmpxchg_weak = .pl_node,
                 .splat = .pl_node,
                 .reduce = .pl_node,
                 .shuffle = .pl_node,
@@ -1797,7 +1789,6 @@ pub const Inst = struct {
                 .memcpy = .pl_node,
                 .memset = .pl_node,
                 .minimum = .pl_node,
-                .builtin_async_call = .pl_node,
                 .c_import = .pl_node,
 
                 .alloc = .un_node,
@@ -1815,6 +1806,9 @@ pub const Inst = struct {
 
                 .closure_capture = .un_tok,
                 .closure_get = .inst_node,
+
+                .@"defer" = .@"defer",
+                .defer_err_code = .defer_err_code,
 
                 .extended = .extended,
             });
@@ -1968,6 +1962,13 @@ pub const Inst = struct {
         /// `operand` is payload index to `UnNode`.
         /// `small` contains `NameStrategy
         reify,
+        /// Implements the `@asyncCall` builtin.
+        /// `operand` is payload index to `AsyncCall`.
+        builtin_async_call,
+        /// Implements the `@cmpxchgStrong` and `@cmpxchgWeak` builtins.
+        /// `small` 0=>weak 1=>strong
+        /// `operand` is payload index to `Cmpxchg`.
+        cmpxchg,
 
         pub const InstData = struct {
             opcode: Extended,
@@ -2569,12 +2570,20 @@ pub const Inst = struct {
                 return zir.nullTerminatedString(self.str);
             }
         },
+        @"defer": struct {
+            index: u32,
+            len: u32,
+        },
+        defer_err_code: struct {
+            err_code: Ref,
+            payload_index: u32,
+        },
 
         // Make sure we don't accidentally add a field to make this union
         // bigger than expected. Note that in Debug builds, Zig is allowed
         // to insert a secret field for safety checks.
         comptime {
-            if (builtin.mode != .Debug) {
+            if (builtin.mode != .Debug and builtin.mode != .ReleaseSafe) {
                 assert(@sizeOf(Data) == 8);
             }
         }
@@ -2605,6 +2614,8 @@ pub const Inst = struct {
             dbg_stmt,
             inst_node,
             str_op,
+            @"defer",
+            defer_err_code,
         };
     };
 
@@ -2946,12 +2957,9 @@ pub const Inst = struct {
             has_else: bool,
             /// If true, there is an underscore prong. This is mutually exclusive with `has_else`.
             has_under: bool,
-            /// If true, the `operand` is a pointer to the value being switched on.
-            /// TODO this flag is redundant with the tag of operand and can be removed.
-            is_ref: bool,
             scalar_cases_len: ScalarCasesLen,
 
-            pub const ScalarCasesLen = u28;
+            pub const ScalarCasesLen = u29;
 
             pub fn specialProng(bits: Bits) SpecialProng {
                 const has_else: u2 = @boolToInt(bits.has_else);
@@ -2987,7 +2995,7 @@ pub const Inst = struct {
             }
 
             if (self.bits.specialProng() != .none) {
-                const body_len = zir.extra[extra_index];
+                const body_len = @truncate(u31, zir.extra[extra_index]);
                 extra_index += 1;
                 const body = zir.extra[extra_index..][0..body_len];
                 extra_index += body.len;
@@ -2997,7 +3005,7 @@ pub const Inst = struct {
             while (true) : (scalar_i += 1) {
                 const item = @intToEnum(Ref, zir.extra[extra_index]);
                 extra_index += 1;
-                const body_len = zir.extra[extra_index];
+                const body_len = @truncate(u31, zir.extra[extra_index]);
                 extra_index += 1;
                 const body = zir.extra[extra_index..][0..body_len];
                 extra_index += body.len;
@@ -3026,7 +3034,7 @@ pub const Inst = struct {
             var extra_index: usize = extra_end + 1;
 
             if (self.bits.specialProng() != .none) {
-                const body_len = zir.extra[extra_index];
+                const body_len = @truncate(u31, zir.extra[extra_index]);
                 extra_index += 1;
                 const body = zir.extra[extra_index..][0..body_len];
                 extra_index += body.len;
@@ -3035,18 +3043,23 @@ pub const Inst = struct {
             var scalar_i: usize = 0;
             while (scalar_i < self.bits.scalar_cases_len) : (scalar_i += 1) {
                 extra_index += 1;
-                const body_len = zir.extra[extra_index];
+                const body_len = @truncate(u31, zir.extra[extra_index]);
                 extra_index += 1;
                 extra_index += body_len;
             }
             var multi_i: u32 = 0;
             while (true) : (multi_i += 1) {
                 const items_len = zir.extra[extra_index];
-                extra_index += 2;
-                const body_len = zir.extra[extra_index];
+                extra_index += 1;
+                const ranges_len = zir.extra[extra_index];
+                extra_index += 1;
+                const body_len = @truncate(u31, zir.extra[extra_index]);
                 extra_index += 1;
                 const items = zir.refSlice(extra_index, items_len);
                 extra_index += items_len;
+                // Each range has a start and an end.
+                extra_index += 2 * ranges_len;
+
                 const body = zir.extra[extra_index..][0..body_len];
                 extra_index += body_len;
 
@@ -3378,6 +3391,7 @@ pub const Inst = struct {
     };
 
     pub const Cmpxchg = struct {
+        node: i32,
         ptr: Ref,
         expected_value: Ref,
         new_value: Ref,
@@ -3450,6 +3464,7 @@ pub const Inst = struct {
     };
 
     pub const AsyncCall = struct {
+        node: i32,
         frame_buffer: Ref,
         result_ptr: Ref,
         fn_ptr: Ref,
@@ -3542,6 +3557,12 @@ pub const Inst = struct {
         node: i32,
         line: u32,
         column: u32,
+    };
+
+    pub const DeferErrCode = struct {
+        remapped_err_code: Index,
+        index: u32,
+        len: u32,
     };
 };
 
@@ -3847,7 +3868,7 @@ fn findDeclsSwitch(
 
     const special_prong = extra.data.bits.specialProng();
     if (special_prong != .none) {
-        const body_len = zir.extra[extra_index];
+        const body_len = @truncate(u31, zir.extra[extra_index]);
         extra_index += 1;
         const body = zir.extra[extra_index..][0..body_len];
         extra_index += body.len;
@@ -3860,7 +3881,7 @@ fn findDeclsSwitch(
         var scalar_i: usize = 0;
         while (scalar_i < scalar_cases_len) : (scalar_i += 1) {
             extra_index += 1;
-            const body_len = zir.extra[extra_index];
+            const body_len = @truncate(u31, zir.extra[extra_index]);
             extra_index += 1;
             const body = zir.extra[extra_index..][0..body_len];
             extra_index += body_len;
@@ -3875,7 +3896,7 @@ fn findDeclsSwitch(
             extra_index += 1;
             const ranges_len = zir.extra[extra_index];
             extra_index += 1;
-            const body_len = zir.extra[extra_index];
+            const body_len = @truncate(u31, zir.extra[extra_index]);
             extra_index += 1;
             const items = zir.refSlice(extra_index, items_len);
             extra_index += items_len;

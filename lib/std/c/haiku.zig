@@ -702,7 +702,7 @@ pub const T = struct {
     pub const CSETAF = 0x8002;
     pub const CSETAW = 0x8003;
     pub const CWAITEVENT = 0x8004;
-    pub const CSBRK = 08005;
+    pub const CSBRK = 0x8005;
     pub const CFLSH = 0x8006;
     pub const CXONC = 0x8007;
     pub const CQUERYCONNECTED = 0x8008;
@@ -738,10 +738,7 @@ const NSIG = 32;
 
 /// Renamed from `sigaction` to `Sigaction` to avoid conflict with the syscall.
 pub const Sigaction = extern struct {
-    pub const handler_fn = switch (builtin.zig_backend) {
-        .stage1 => fn (i32) callconv(.C) void,
-        else => *const fn (i32) callconv(.C) void,
-    };
+    pub const handler_fn = std.meta.FnPtr(fn (i32) callconv(.C) void);
 
     /// signal handler
     __sigaction_u: extern union {
@@ -874,7 +871,7 @@ pub const S = struct {
     pub const IFDIR = 0o040000;
     pub const IFCHR = 0o020000;
     pub const IFIFO = 0o010000;
-    pub const INDEX_DIR = 04000000000;
+    pub const INDEX_DIR = 0o4000000000;
 
     pub const IUMSK = 0o7777;
     pub const ISUID = 0o4000;

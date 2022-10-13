@@ -22,10 +22,6 @@ pub var base_allocator_instance = std.heap.FixedBufferAllocator.init("");
 /// TODO https://github.com/ziglang/zig/issues/5738
 pub var log_level = std.log.Level.warn;
 
-/// This is available to any test that wants to execute Zig in a child process.
-/// It will be the same executable that is running `zig test`.
-pub var zig_exe_path: []const u8 = undefined;
-
 /// This function is intended to be used only in tests. It prints diagnostics to stderr
 /// and then returns a test failure error when actual_error_union is not expected_error.
 pub fn expectError(expected_error: anyerror, actual_error_union: anytype) !void {
@@ -217,8 +213,8 @@ pub fn expectFmt(expected: []const u8, comptime template: []const u8, args: anyt
 /// This function is intended to be used only in tests. When the actual value is
 /// not approximately equal to the expected value, prints diagnostics to stderr
 /// to show exactly how they are not equal, then returns a test failure error.
-/// See `math.approxEqAbs` for more informations on the tolerance parameter.
-/// The types must be floating point
+/// See `math.approxEqAbs` for more information on the tolerance parameter.
+/// The types must be floating-point.
 pub fn expectApproxEqAbs(expected: anytype, actual: @TypeOf(expected), tolerance: @TypeOf(expected)) !void {
     const T = @TypeOf(expected);
 
@@ -249,8 +245,8 @@ test "expectApproxEqAbs" {
 /// This function is intended to be used only in tests. When the actual value is
 /// not approximately equal to the expected value, prints diagnostics to stderr
 /// to show exactly how they are not equal, then returns a test failure error.
-/// See `math.approxEqRel` for more informations on the tolerance parameter.
-/// The types must be floating point
+/// See `math.approxEqRel` for more information on the tolerance parameter.
+/// The types must be floating-point.
 pub fn expectApproxEqRel(expected: anytype, actual: @TypeOf(expected), tolerance: @TypeOf(expected)) !void {
     const T = @TypeOf(expected);
 
@@ -498,7 +494,7 @@ pub fn expectStringStartsWith(actual: []const u8, expected_starts_with: []const 
 
     print("\n====== expected to start with: =========\n", .{});
     printWithVisibleNewlines(expected_starts_with);
-    print("\n====== instead ended with: ===========\n", .{});
+    print("\n====== instead started with: ===========\n", .{});
     printWithVisibleNewlines(shortened_actual);
     print("\n========= full output: ==============\n", .{});
     printWithVisibleNewlines(actual);
@@ -723,7 +719,7 @@ pub fn checkAllAllocationFailures(backing_allocator: std.mem.Allocator, comptime
     }
 }
 
-/// Given a type, reference all the declarations inside, so that the semantic analyzer sees them.
+/// Given a type, references all the declarations inside, so that the semantic analyzer sees them.
 pub fn refAllDecls(comptime T: type) void {
     if (!builtin.is_test) return;
     inline for (comptime std.meta.declarations(T)) |decl| {
@@ -731,9 +727,10 @@ pub fn refAllDecls(comptime T: type) void {
     }
 }
 
-/// Given a type, and Recursively reference all the declarations inside, so that the semantic analyzer sees them.
-/// For deep types, you may use `@setEvalBranchQuota`
+/// Given a type, recursively references all the declarations inside, so that the semantic analyzer sees them.
+/// For deep types, you may use `@setEvalBranchQuota`.
 pub fn refAllDeclsRecursive(comptime T: type) void {
+    if (!builtin.is_test) return;
     inline for (comptime std.meta.declarations(T)) |decl| {
         if (decl.is_pub) {
             if (@TypeOf(@field(T, decl.name)) == type) {

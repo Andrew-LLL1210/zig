@@ -170,14 +170,6 @@ pub fn approxEqRel(comptime T: type, x: T, y: T, tolerance: T) bool {
     return @fabs(x - y) <= max(@fabs(x), @fabs(y)) * tolerance;
 }
 
-pub fn approxEq(comptime T: type, x: T, y: T, tolerance: T) bool {
-    _ = T;
-    _ = x;
-    _ = y;
-    _ = tolerance;
-    @compileError("deprecated; use `approxEqAbs` or `approxEqRel`");
-}
-
 test "approxEqAbs and approxEqRel" {
     inline for ([_]type{ f16, f32, f64, f128 }) |T| {
         const eps_value = comptime floatEps(T);
@@ -270,6 +262,7 @@ pub const atanh = @import("math/atanh.zig").atanh;
 pub const sinh = @import("math/sinh.zig").sinh;
 pub const cosh = @import("math/cosh.zig").cosh;
 pub const tanh = @import("math/tanh.zig").tanh;
+pub const gcd = @import("math/gcd.zig").gcd;
 
 /// Sine trigonometric function on a floating point number.
 /// Uses a dedicated hardware instruction when available.
@@ -292,10 +285,10 @@ pub inline fn tan(value: anytype) @TypeOf(value) {
     return @tan(value);
 }
 
-// Convert an angle in radians to degrees. T must be a float type.
+/// Converts an angle in radians to degrees. T must be a float type.
 pub fn radiansToDegrees(comptime T: type, angle_in_radians: T) T {
-    if (@typeInfo(T) != .Float)
-        @compileError("T must be a float type.");
+    if (@typeInfo(T) != .Float and @typeInfo(T) != .ComptimeFloat)
+        @compileError("T must be a float type");
     return angle_in_radians * 180.0 / pi;
 }
 
@@ -307,10 +300,10 @@ test "radiansToDegrees" {
     try std.testing.expectApproxEqAbs(@as(f32, 360), radiansToDegrees(f32, 2.0 * pi), 1e-6);
 }
 
-// Convert an angle in degrees to radians. T must be a float type.
+/// Converts an angle in degrees to radians. T must be a float type.
 pub fn degreesToRadians(comptime T: type, angle_in_degrees: T) T {
-    if (@typeInfo(T) != .Float)
-        @compileError("T must be a float type.");
+    if (@typeInfo(T) != .Float and @typeInfo(T) != .ComptimeFloat)
+        @compileError("T must be a float type");
     return angle_in_degrees * pi / 180.0;
 }
 
@@ -605,6 +598,8 @@ test "shr" {
 pub fn rotr(comptime T: type, x: T, r: anytype) T {
     if (@typeInfo(T) == .Vector) {
         const C = @typeInfo(T).Vector.child;
+        if (C == u0) return 0;
+
         if (@typeInfo(C).Int.signedness == .signed) {
             @compileError("cannot rotate signed integers");
         }
@@ -613,8 +608,15 @@ pub fn rotr(comptime T: type, x: T, r: anytype) T {
     } else if (@typeInfo(T).Int.signedness == .signed) {
         @compileError("cannot rotate signed integer");
     } else {
-        const ar = @intCast(Log2Int(T), @mod(r, @typeInfo(T).Int.bits));
-        return x >> ar | x << (1 +% ~ar);
+        if (T == u0) return 0;
+
+        if (isPowerOfTwo(@typeInfo(T).Int.bits)) {
+            const ar = @intCast(Log2Int(T), @mod(r, @typeInfo(T).Int.bits));
+            return x >> ar | x << (1 +% ~ar);
+        } else {
+            const ar = @mod(r, @typeInfo(T).Int.bits);
+            return shr(T, x, ar) | shl(T, x, @typeInfo(T).Int.bits - ar);
+        }
     }
 }
 
@@ -625,6 +627,9 @@ test "rotr" {
         // https://github.com/ziglang/zig/issues/12012
         return error.SkipZigTest;
     }
+    try testing.expect(rotr(u0, 0b0, @as(usize, 3)) == 0b0);
+    try testing.expect(rotr(u5, 0b00001, @as(usize, 0)) == 0b00001);
+    try testing.expect(rotr(u6, 0b000001, @as(usize, 7)) == 0b100000);
     try testing.expect(rotr(u8, 0b00000001, @as(usize, 0)) == 0b00000001);
     try testing.expect(rotr(u8, 0b00000001, @as(usize, 9)) == 0b10000000);
     try testing.expect(rotr(u8, 0b00000001, @as(usize, 8)) == 0b00000001);
@@ -639,6 +644,8 @@ test "rotr" {
 pub fn rotl(comptime T: type, x: T, r: anytype) T {
     if (@typeInfo(T) == .Vector) {
         const C = @typeInfo(T).Vector.child;
+        if (C == u0) return 0;
+
         if (@typeInfo(C).Int.signedness == .signed) {
             @compileError("cannot rotate signed integers");
         }
@@ -647,8 +654,15 @@ pub fn rotl(comptime T: type, x: T, r: anytype) T {
     } else if (@typeInfo(T).Int.signedness == .signed) {
         @compileError("cannot rotate signed integer");
     } else {
-        const ar = @intCast(Log2Int(T), @mod(r, @typeInfo(T).Int.bits));
-        return x << ar | x >> 1 +% ~ar;
+        if (T == u0) return 0;
+
+        if (isPowerOfTwo(@typeInfo(T).Int.bits)) {
+            const ar = @intCast(Log2Int(T), @mod(r, @typeInfo(T).Int.bits));
+            return x << ar | x >> 1 +% ~ar;
+        } else {
+            const ar = @mod(r, @typeInfo(T).Int.bits);
+            return shl(T, x, ar) | shr(T, x, @typeInfo(T).Int.bits - ar);
+        }
     }
 }
 
@@ -659,6 +673,9 @@ test "rotl" {
         // https://github.com/ziglang/zig/issues/12012
         return error.SkipZigTest;
     }
+    try testing.expect(rotl(u0, 0b0, @as(usize, 3)) == 0b0);
+    try testing.expect(rotl(u5, 0b00001, @as(usize, 0)) == 0b00001);
+    try testing.expect(rotl(u6, 0b000001, @as(usize, 7)) == 0b000010);
     try testing.expect(rotl(u8, 0b00000001, @as(usize, 0)) == 0b00000001);
     try testing.expect(rotl(u8, 0b00000001, @as(usize, 9)) == 0b00000010);
     try testing.expect(rotl(u8, 0b00000001, @as(usize, 8)) == 0b00000001);
@@ -769,14 +786,14 @@ fn testOverflow() !void {
     try testing.expect((shlExact(i32, 0b11, 4) catch unreachable) == 0b110000);
 }
 
-/// Returns the absolute value of x, where x is a value of an integer
-/// type.
+/// Returns the absolute value of x, where x is a value of a signed integer type.
+/// See also: `absCast`
 pub fn absInt(x: anytype) !@TypeOf(x) {
     const T = @TypeOf(x);
     comptime assert(@typeInfo(T) == .Int); // must pass an integer to absInt
     comptime assert(@typeInfo(T).Int.signedness == .signed); // must pass a signed integer to absInt
 
-    if (x == minInt(@TypeOf(x))) {
+    if (x == minInt(T)) {
         return error.Overflow;
     } else {
         @setRuntimeSafety(false);
@@ -984,6 +1001,7 @@ pub inline fn fabs(value: anytype) @TypeOf(value) {
 
 /// Returns the absolute value of the integer parameter.
 /// Result is an unsigned integer.
+/// See also: `absInt`
 pub fn absCast(x: anytype) switch (@typeInfo(@TypeOf(x))) {
     .ComptimeInt => comptime_int,
     .Int => |int_info| std.meta.Int(.unsigned, int_info.bits),
@@ -1146,7 +1164,7 @@ pub fn ceilPowerOfTwoPromote(comptime T: type, value: T) std.meta.Int(@typeInfo(
     assert(value != 0);
     const PromotedType = std.meta.Int(@typeInfo(T).Int.signedness, @typeInfo(T).Int.bits + 1);
     const ShiftType = std.math.Log2Int(PromotedType);
-    return @as(PromotedType, 1) << @intCast(ShiftType, @typeInfo(T).Int.bits - @clz(T, value - 1));
+    return @as(PromotedType, 1) << @intCast(ShiftType, @typeInfo(T).Int.bits - @clz(value - 1));
 }
 
 /// Returns the next power of two (if the value is not already a power of two).
@@ -1212,7 +1230,7 @@ pub fn log2_int(comptime T: type, x: T) Log2Int(T) {
     if (@typeInfo(T) != .Int or @typeInfo(T).Int.signedness != .unsigned)
         @compileError("log2_int requires an unsigned integer, found " ++ @typeName(T));
     assert(x != 0);
-    return @intCast(Log2Int(T), @typeInfo(T).Int.bits - 1 - @clz(T, x));
+    return @intCast(Log2Int(T), @typeInfo(T).Int.bits - 1 - @clz(x));
 }
 
 /// Return the log base 2 of integer value x, rounding up to the
@@ -1548,7 +1566,7 @@ test "boolMask" {
 }
 
 /// Return the mod of `num` with the smallest integer type
-pub fn comptimeMod(num: anytype, denom: comptime_int) IntFittingRange(0, denom - 1) {
+pub fn comptimeMod(num: anytype, comptime denom: comptime_int) IntFittingRange(0, denom - 1) {
     return @intCast(IntFittingRange(0, denom - 1), @mod(num, denom));
 }
 

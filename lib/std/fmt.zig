@@ -29,7 +29,7 @@ pub const FormatOptions = struct {
 /// If `writer` returns an error, the error is returned from `format` and
 /// `writer` is not called again.
 ///
-/// The format string must be comptime known and may contain placeholders following
+/// The format string must be comptime-known and may contain placeholders following
 /// this format:
 /// `{[argument][specifier]:[fill][alignment][width].[precision]}`
 ///
@@ -195,7 +195,7 @@ pub fn format(
     }
 
     if (comptime arg_state.hasUnusedArgs()) {
-        const missing_count = arg_state.args_len - @popCount(ArgSetType, arg_state.used_args);
+        const missing_count = arg_state.args_len - @popCount(arg_state.used_args);
         switch (missing_count) {
             0 => unreachable,
             1 => @compileError("unused argument in '" ++ fmt ++ "'"),
@@ -380,7 +380,7 @@ const ArgState = struct {
     args_len: usize,
 
     fn hasUnusedArgs(self: *@This()) bool {
-        return @popCount(ArgSetType, self.used_args) != self.args_len;
+        return @popCount(self.used_args) != self.args_len;
     }
 
     fn nextArg(self: *@This(), arg_index: ?usize) ?usize {
@@ -1004,8 +1004,7 @@ pub fn formatAsciiChar(
     options: FormatOptions,
     writer: anytype,
 ) !void {
-    _ = options;
-    return writer.writeAll(@as(*const [1]u8, &c));
+    return formatBuf(@as(*const [1]u8, &c), options, writer);
 }
 
 pub fn formatUnicodeCodepoint(
@@ -1885,7 +1884,6 @@ test "parseUnsigned" {
 }
 
 pub const parseFloat = @import("fmt/parse_float.zig").parseFloat;
-pub const parseHexFloat = @compileError("deprecated; use `parseFloat`");
 pub const ParseFloatError = @import("fmt/parse_float.zig").ParseFloatError;
 
 test {
@@ -1947,8 +1945,6 @@ pub fn allocPrint(allocator: mem.Allocator, comptime fmt: []const u8, args: anyt
         error.NoSpaceLeft => unreachable, // we just counted the size above
     };
 }
-
-pub const allocPrint0 = @compileError("deprecated; use allocPrintZ");
 
 pub fn allocPrintZ(allocator: mem.Allocator, comptime fmt: []const u8, args: anytype) AllocPrintError![:0]u8 {
     const result = try allocPrint(allocator, fmt ++ "\x00", args);
@@ -2177,18 +2173,18 @@ test "escape non-printable" {
 }
 
 test "pointer" {
-    if (builtin.zig_backend == .stage1) return error.SkipZigTest;
     {
         const value = @intToPtr(*align(1) i32, 0xdeadbeef);
         try expectFmt("pointer: i32@deadbeef\n", "pointer: {}\n", .{value});
         try expectFmt("pointer: i32@deadbeef\n", "pointer: {*}\n", .{value});
     }
+    const FnPtr = if (builtin.zig_backend == .stage1) fn () void else *align(1) const fn () void;
     {
-        const value = @intToPtr(*align(1) const fn () void, 0xdeadbeef);
+        const value = @intToPtr(FnPtr, 0xdeadbeef);
         try expectFmt("pointer: fn() void@deadbeef\n", "pointer: {}\n", .{value});
     }
     {
-        const value = @intToPtr(*align(1) const fn () void, 0xdeadbeef);
+        const value = @intToPtr(FnPtr, 0xdeadbeef);
         try expectFmt("pointer: fn() void@deadbeef\n", "pointer: {}\n", .{value});
     }
 }
@@ -2727,6 +2723,9 @@ test "padding" {
     try expectFmt("==crêpe===", "{s:=^10}", .{"crêpe"});
     try expectFmt("=====crêpe", "{s:=>10}", .{"crêpe"});
     try expectFmt("crêpe=====", "{s:=<10}", .{"crêpe"});
+    try expectFmt("====a", "{c:=>5}", .{'a'});
+    try expectFmt("==a==", "{c:=^5}", .{'a'});
+    try expectFmt("a====", "{c:=<5}", .{'a'});
 }
 
 test "decimal float padding" {

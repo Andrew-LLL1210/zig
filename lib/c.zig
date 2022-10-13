@@ -58,7 +58,7 @@ comptime {
 
 // Avoid dragging in the runtime safety mechanisms into this .o file,
 // unless we're trying to test this file.
-pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace) noreturn {
+pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, _: ?usize) noreturn {
     @setCold(true);
     _ = error_return_trace;
     if (builtin.is_test) {
@@ -298,10 +298,10 @@ fn strerror(errnum: c_int) callconv(.C) [*:0]const u8 {
 }
 
 test "strncmp" {
-    try std.testing.expect(strncmp("a", "b", 1) == -1);
-    try std.testing.expect(strncmp("a", "c", 1) == -2);
-    try std.testing.expect(strncmp("b", "a", 1) == 1);
-    try std.testing.expect(strncmp("\xff", "\x02", 1) == 253);
+    try std.testing.expect(strncmp("a", "b", 1) < 0);
+    try std.testing.expect(strncmp("a", "c", 1) < 0);
+    try std.testing.expect(strncmp("b", "a", 1) > 0);
+    try std.testing.expect(strncmp("\xff", "\x02", 1) > 0);
 }
 
 // TODO we should be able to put this directly in std/linux/x86_64.zig but

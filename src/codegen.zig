@@ -363,9 +363,19 @@ pub fn generateSymbol(
                         const mod = bin_file.options.module.?;
                         const decl = mod.declPtr(decl_index);
                         const addend = blk: {
-                            switch (decl.ty.tag()) {
-                                .@"struct" => {
+                            switch (decl.ty.zigTypeTag()) {
+                                .Struct => {
                                     const addend = decl.ty.structFieldOffset(field_ptr.field_index, target);
+                                    break :blk @intCast(u32, addend);
+                                },
+                                .Pointer => {
+                                    assert(decl.ty.isSlice());
+                                    var buf: Type.SlicePtrFieldTypeBuffer = undefined;
+                                    const addend = switch (field_ptr.field_index) {
+                                        0 => 0,
+                                        1 => decl.ty.slicePtrFieldType(&buf).abiSize(target),
+                                        else => unreachable,
+                                    };
                                     break :blk @intCast(u32, addend);
                                 },
                                 else => return Result{
@@ -607,7 +617,7 @@ pub fn generateSymbol(
 
             const union_ty = typed_value.ty.cast(Type.Payload.Union).?.data;
             const mod = bin_file.options.module.?;
-            const field_index = union_ty.tag_ty.enumTagFieldIndex(union_obj.tag, mod).?;
+            const field_index = typed_value.ty.unionTagFieldIndex(union_obj.tag, mod).?;
             assert(union_ty.haveFieldTypes());
             const field_ty = union_ty.fields.values()[field_index].ty;
             if (!field_ty.hasRuntimeBits()) {

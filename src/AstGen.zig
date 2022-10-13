@@ -135,7 +135,6 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
     var gz_instructions: std.ArrayListUnmanaged(Zir.Inst.Index) = .{};
     var gen_scope: GenZir = .{
         .force_comptime = true,
-        .in_defer = false,
         .parent = &top_scope.base,
         .anon_name_strategy = .parent,
         .decl_node_index = 0,
@@ -226,6 +225,8 @@ pub const ResultLoc = union(enum) {
     ref,
     /// The expression will be coerced into this type, but it will be evaluated as an rvalue.
     ty: Zir.Inst.Ref,
+    /// Same as `ty` but for shift operands.
+    ty_shift_operand: Zir.Inst.Ref,
     /// Same as `ty` but it is guaranteed that Sema will additionally perform the coercion,
     /// so no `as` instruction needs to be emitted.
     coerced_ty: Zir.Inst.Ref,
@@ -259,7 +260,7 @@ pub const ResultLoc = union(enum) {
     fn strategy(rl: ResultLoc, block_scope: *GenZir) Strategy {
         switch (rl) {
             // In this branch there will not be any store_to_block_ptr instructions.
-            .none, .ty, .coerced_ty, .ref => return .{
+            .none, .ty, .ty_shift_operand, .coerced_ty, .ref => return .{
                 .tag = .break_operand,
                 .elide_store_to_block_ptr_instructions = false,
             },
@@ -300,6 +301,14 @@ pub const ResultLoc = union(enum) {
         return switch (rl) {
             .coerced_ty => |ty| .{ .ty = ty },
             else => rl,
+        };
+    }
+
+    fn zirTag(rl: ResultLoc) Zir.Inst.Tag {
+        return switch (rl) {
+            .ty => .as_node,
+            .ty_shift_operand => .as_shift_operand,
+            else => unreachable,
         };
     }
 };
@@ -377,7 +386,9 @@ fn lvalExpr(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Ins
         .simple_var_decl => unreachable,
         .aligned_var_decl => unreachable,
         .switch_case => unreachable,
+        .switch_case_inline => unreachable,
         .switch_case_one => unreachable,
+        .switch_case_inline_one => unreachable,
         .container_field_init => unreachable,
         .container_field_align => unreachable,
         .container_field => unreachable,
@@ -432,7 +443,7 @@ fn lvalExpr(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Ins
         .@"asm",
         .asm_simple,
         .string_literal,
-        .integer_literal,
+        .number_literal,
         .call,
         .call_comma,
         .async_call,
@@ -450,7 +461,6 @@ fn lvalExpr(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Ins
         .while_cont,
         .bool_not,
         .address_of,
-        .float_literal,
         .optional_type,
         .block,
         .block_semicolon,
@@ -569,6 +579,12 @@ fn expr(gz: *GenZir, scope: *Scope, rl: ResultLoc, node: Ast.Node.Index) InnerEr
     const node_datas = tree.nodes.items(.data);
     const node_tags = tree.nodes.items(.tag);
 
+    const prev_anon_name_strategy = gz.anon_name_strategy;
+    defer gz.anon_name_strategy = prev_anon_name_strategy;
+    if (!nodeUsesAnonNameStrategy(tree, node)) {
+        gz.anon_name_strategy = .anon;
+    }
+
     switch (node_tags[node]) {
         .root => unreachable, // Top-level declaration.
         .@"usingnamespace" => unreachable, // Top-level declaration.
@@ -586,7 +602,9 @@ fn expr(gz: *GenZir, scope: *Scope, rl: ResultLoc, node: Ast.Node.Index) InnerEr
         .@"errdefer" => unreachable, // Handled in `blockExpr`.
 
         .switch_case => unreachable, // Handled in `switchExpr`.
+        .switch_case_inline => unreachable, // Handled in `switchExpr`.
         .switch_case_one => unreachable, // Handled in `switchExpr`.
+        .switch_case_inline_one => unreachable, // Handled in `switchExpr`.
         .switch_range => unreachable, // Handled in `switchExpr`.
 
         .asm_output => unreachable, // Handled in `asmExpr`.
@@ -723,7 +741,7 @@ fn expr(gz: *GenZir, scope: *Scope, rl: ResultLoc, node: Ast.Node.Index) InnerEr
         .string_literal           => return stringLiteral(gz, rl, node),
         .multiline_string_literal => return multilineStringLiteral(gz, rl, node),
 
-        .integer_literal => return integerLiteral(gz, rl, node),
+        .number_literal => return numberLiteral(gz, rl, node, node, .positive),
         // zig fmt: on
 
         .builtin_call_two, .builtin_call_two_comma => {
@@ -764,7 +782,6 @@ fn expr(gz: *GenZir, scope: *Scope, rl: ResultLoc, node: Ast.Node.Index) InnerEr
         },
         .@"return" => return ret(gz, scope, node),
         .field_access => return fieldAccess(gz, scope, rl, node),
-        .float_literal => return floatLiteral(gz, rl, node, .positive),
 
         .if_simple => return ifExpr(gz, scope, rl.br(), node, tree.ifSimple(node)),
         .@"if" => return ifExpr(gz, scope, rl.br(), node, tree.ifFull(node)),
@@ -877,33 +894,6 @@ fn expr(gz: *GenZir, scope: *Scope, rl: ResultLoc, node: Ast.Node.Index) InnerEr
                 catch_token + 2
             else
                 null;
-
-            var rhs = node_datas[node].rhs;
-            while (true) switch (node_tags[rhs]) {
-                .grouped_expression => rhs = node_datas[rhs].lhs,
-                .unreachable_literal => {
-                    if (payload_token != null and mem.eql(u8, tree.tokenSlice(payload_token.?), "_")) {
-                        return astgen.failTok(payload_token.?, "discard of error capture; omit it instead", .{});
-                    } else if (payload_token != null) {
-                        return astgen.failTok(payload_token.?, "unused capture", .{});
-                    }
-                    const lhs = node_datas[node].lhs;
-
-                    const operand = try reachableExpr(gz, scope, switch (rl) {
-                        .ref => .ref,
-                        else => .none,
-                    }, lhs, lhs);
-                    const result = try gz.addUnNode(switch (rl) {
-                        .ref => .err_union_payload_safe_ptr,
-                        else => .err_union_payload_safe,
-                    }, operand, node);
-                    switch (rl) {
-                        .none, .coerced_ty, .discard, .ref => return result,
-                        else => return rvalue(gz, rl, result, lhs),
-                    }
-                },
-                else => break,
-            };
             switch (rl) {
                 .ref => return orelseCatchExpr(
                     gz,
@@ -1164,6 +1154,10 @@ fn fnProtoExpr(
     const tree = astgen.tree;
     const token_tags = tree.tokens.items(.tag);
 
+    if (fn_proto.name_token) |some| {
+        return astgen.failTok(some, "function type cannot have a name", .{});
+    }
+
     const is_extern = blk: {
         const maybe_extern_token = fn_proto.extern_export_inline_token orelse break :blk false;
         break :blk token_tags[maybe_extern_token] == .keyword_extern;
@@ -1381,7 +1375,7 @@ fn arrayInitExpr(
             const tag: Zir.Inst.Tag = if (types.array != .none) .array_init else .array_init_anon;
             return arrayInitExprInner(gz, scope, node, array_init.ast.elements, types.array, types.elem, tag);
         },
-        .ty, .coerced_ty => {
+        .ty, .ty_shift_operand, .coerced_ty => {
             const tag: Zir.Inst.Tag = if (types.array != .none) .array_init else .array_init_anon;
             const result = try arrayInitExprInner(gz, scope, node, array_init.ast.elements, types.array, types.elem, tag);
             return rvalue(gz, rl, result, node);
@@ -1627,7 +1621,7 @@ fn structInitExpr(
                 return structInitExprRlNone(gz, scope, node, struct_init, .none, .struct_init_anon);
             }
         },
-        .ty, .coerced_ty => |ty_inst| {
+        .ty, .ty_shift_operand, .coerced_ty => |ty_inst| {
             if (struct_init.ast.type_expr == 0) {
                 const result = try structInitExprRlNone(gz, scope, node, struct_init, ty_inst, .struct_init_anon);
                 return rvalue(gz, rl, result, node);
@@ -1842,6 +1836,16 @@ fn breakExpr(parent_gz: *GenZir, parent_scope: *Scope, node: Ast.Node.Index) Inn
             .gen_zir => {
                 const block_gz = scope.cast(GenZir).?;
 
+                if (block_gz.cur_defer_node != 0) {
+                    return astgen.failNodeNotes(node, "cannot break out of defer expression", .{}, &.{
+                        try astgen.errNoteNode(
+                            block_gz.cur_defer_node,
+                            "defer expression here",
+                            .{},
+                        ),
+                    });
+                }
+
                 const block_inst = blk: {
                     if (break_label != 0) {
                         if (block_gz.label) |*label| {
@@ -1870,15 +1874,8 @@ fn breakExpr(parent_gz: *GenZir, parent_scope: *Scope, node: Ast.Node.Index) Inn
                 }
                 block_gz.break_count += 1;
 
-                // The loop scope has a mechanism to prevent rvalue() from emitting a
-                // store to the result location for the loop body (since it is continues
-                // rather than returning a result from the loop) but here is a `break`
-                // which needs to override this behavior.
-                const prev_rvalue_noresult = parent_gz.rvalue_noresult;
-                parent_gz.rvalue_noresult = .none;
                 const operand = try reachableExpr(parent_gz, parent_scope, block_gz.break_result_loc, rhs, node);
                 const search_index = @intCast(Zir.Inst.Index, astgen.instructions.len);
-                parent_gz.rvalue_noresult = prev_rvalue_noresult;
 
                 try genDefers(parent_gz, scope, parent_scope, .normal_only);
 
@@ -1905,17 +1902,6 @@ fn breakExpr(parent_gz: *GenZir, parent_scope: *Scope, node: Ast.Node.Index) Inn
             .local_ptr => scope = scope.cast(Scope.LocalPtr).?.parent,
             .namespace => break,
             .defer_normal, .defer_error => scope = scope.cast(Scope.Defer).?.parent,
-            .defer_gen => {
-                const defer_gen = scope.cast(Scope.DeferGen).?;
-
-                return astgen.failNodeNotes(node, "cannot break out of defer expression", .{}, &.{
-                    try astgen.errNoteNode(
-                        defer_gen.defer_node,
-                        "defer expression here",
-                        .{},
-                    ),
-                });
-            },
             .top => unreachable,
         }
     }
@@ -1939,6 +1925,16 @@ fn continueExpr(parent_gz: *GenZir, parent_scope: *Scope, node: Ast.Node.Index) 
         switch (scope.tag) {
             .gen_zir => {
                 const gen_zir = scope.cast(GenZir).?;
+
+                if (gen_zir.cur_defer_node != 0) {
+                    return astgen.failNodeNotes(node, "cannot continue out of defer expression", .{}, &.{
+                        try astgen.errNoteNode(
+                            gen_zir.cur_defer_node,
+                            "defer expression here",
+                            .{},
+                        ),
+                    });
+                }
                 const continue_block = gen_zir.continue_block;
                 if (continue_block == 0) {
                     scope = gen_zir.parent;
@@ -1961,7 +1957,7 @@ fn continueExpr(parent_gz: *GenZir, parent_scope: *Scope, node: Ast.Node.Index) 
                 else
                     .@"break";
                 if (break_tag == .break_inline) {
-                    _ = try parent_gz.addNode(.check_comptime_control_flow, node);
+                    _ = try parent_gz.addUnNode(.check_comptime_control_flow, Zir.indexToRef(continue_block), node);
                 }
                 _ = try parent_gz.addBreak(break_tag, continue_block, .void_value);
                 return Zir.Inst.Ref.unreachable_value;
@@ -1971,21 +1967,9 @@ fn continueExpr(parent_gz: *GenZir, parent_scope: *Scope, node: Ast.Node.Index) 
             .defer_normal => {
                 const defer_scope = scope.cast(Scope.Defer).?;
                 scope = defer_scope.parent;
-                const expr_node = node_datas[defer_scope.defer_node].rhs;
-                try unusedResultDeferExpr(parent_gz, defer_scope, defer_scope.parent, expr_node);
+                try parent_gz.addDefer(defer_scope.index, defer_scope.len);
             },
             .defer_error => scope = scope.cast(Scope.Defer).?.parent,
-            .defer_gen => {
-                const defer_gen = scope.cast(Scope.DeferGen).?;
-
-                return astgen.failNodeNotes(node, "cannot continue out of defer expression", .{}, &.{
-                    try astgen.errNoteNode(
-                        defer_gen.defer_node,
-                        "defer expression here",
-                        .{},
-                    ),
-                });
-            },
             .namespace => break,
             .top => unreachable,
         }
@@ -2020,7 +2004,8 @@ fn blockExpr(
         return labeledBlockExpr(gz, scope, rl, block_node, statements);
     }
 
-    try blockExprStmts(gz, scope, statements);
+    var sub_gz = gz.makeSubBlock(scope);
+    try blockExprStmts(&sub_gz, &sub_gz.base, statements);
     return rvalue(gz, rl, .void_value, block_node);
 }
 
@@ -2050,7 +2035,6 @@ fn checkLabelRedefinition(astgen: *AstGen, parent_scope: *Scope, label: Ast.Toke
             .local_val => scope = scope.cast(Scope.LocalVal).?.parent,
             .local_ptr => scope = scope.cast(Scope.LocalPtr).?.parent,
             .defer_normal, .defer_error => scope = scope.cast(Scope.Defer).?.parent,
-            .defer_gen => scope = scope.cast(Scope.DeferGen).?.parent,
             .namespace => break,
             .top => unreachable,
         }
@@ -2194,8 +2178,8 @@ fn blockExprStmts(gz: *GenZir, parent_scope: *Scope, statements: []const Ast.Nod
             .simple_var_decl  => scope = try varDecl(gz, scope, statement, block_arena_allocator, tree.simpleVarDecl(statement)),
             .aligned_var_decl => scope = try varDecl(gz, scope, statement, block_arena_allocator, tree.alignedVarDecl(statement)),
 
-            .@"defer"    => scope = try makeDeferScope(gz.astgen, scope, statement, block_arena_allocator, .defer_normal),
-            .@"errdefer" => scope = try makeDeferScope(gz.astgen, scope, statement, block_arena_allocator, .defer_error),
+            .@"defer"    => scope = try deferStmt(gz, scope, statement, block_arena_allocator, .defer_normal),
+            .@"errdefer" => scope = try deferStmt(gz, scope, statement, block_arena_allocator, .defer_error),
 
             .assign => try assign(gz, scope, statement),
 
@@ -2213,7 +2197,7 @@ fn blockExprStmts(gz: *GenZir, parent_scope: *Scope, statements: []const Ast.Nod
             .assign_add_wrap => try assignOp(gz, scope, statement, .addwrap),
             .assign_mul      => try assignOp(gz, scope, statement, .mul),
             .assign_mul_wrap => try assignOp(gz, scope, statement, .mulwrap),
-            
+
             .grouped_expression => {
                 inner_node = node_data[statement].lhs;
                 continue;
@@ -2237,28 +2221,6 @@ fn blockExprStmts(gz: *GenZir, parent_scope: *Scope, statements: []const Ast.Nod
 
     try genDefers(gz, parent_scope, scope, .normal_only);
     try checkUsed(gz, parent_scope, scope);
-}
-
-fn unusedResultDeferExpr(gz: *GenZir, defer_scope: *Scope.Defer, expr_scope: *Scope, expr_node: Ast.Node.Index) InnerError!void {
-    const astgen = gz.astgen;
-    const prev_offset = astgen.source_offset;
-    const prev_line = astgen.source_line;
-    const prev_column = astgen.source_column;
-    defer {
-        astgen.source_offset = prev_offset;
-        astgen.source_line = prev_line;
-        astgen.source_column = prev_column;
-    }
-    astgen.source_offset = defer_scope.source_offset;
-    astgen.source_line = defer_scope.source_line;
-    astgen.source_column = defer_scope.source_column;
-
-    var defer_gen: Scope.DeferGen = .{
-        .parent = expr_scope,
-        .defer_node = defer_scope.defer_node,
-    };
-
-    _ = try unusedResultExpr(gz, &defer_gen.base, expr_node);
 }
 
 /// Returns AST source node of the thing that is noreturn if the statement is
@@ -2323,6 +2285,7 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .anyframe_type,
             .as,
             .as_node,
+            .as_shift_operand,
             .bit_and,
             .bitcast,
             .bit_or,
@@ -2389,9 +2352,7 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .optional_payload_unsafe,
             .optional_payload_safe_ptr,
             .optional_payload_unsafe_ptr,
-            .err_union_payload_safe,
             .err_union_payload_unsafe,
-            .err_union_payload_safe_ptr,
             .err_union_payload_unsafe_ptr,
             .err_union_code,
             .err_union_code_ptr,
@@ -2413,6 +2374,7 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .switch_capture_ref,
             .switch_capture_multi,
             .switch_capture_multi_ref,
+            .switch_capture_tag,
             .struct_init_empty,
             .struct_init,
             .struct_init_ref,
@@ -2482,8 +2444,6 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .shr_exact,
             .bit_offset_of,
             .offset_of,
-            .cmpxchg_strong,
-            .cmpxchg_weak,
             .splat,
             .reduce,
             .shuffle,
@@ -2493,7 +2453,6 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .field_parent_ptr,
             .maximum,
             .minimum,
-            .builtin_async_call,
             .c_import,
             .@"resume",
             .@"await",
@@ -2547,10 +2506,10 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .dbg_block_end,
             .ensure_result_used,
             .ensure_result_non_error,
+            .ensure_err_union_payload_void,
             .@"export",
             .export_value,
             .set_eval_branch_quota,
-            .ensure_err_payload_void,
             .atomic_store,
             .store,
             .store_node,
@@ -2570,6 +2529,9 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
             .validate_struct_init_ty,
             .validate_deref,
             => break :b true,
+
+            .@"defer" => unreachable,
+            .defer_err_code => unreachable,
         }
     } else switch (maybe_unused_result) {
         .none => unreachable,
@@ -2589,15 +2551,12 @@ fn addEnsureResult(gz: *GenZir, maybe_unused_result: Zir.Inst.Ref, statement: As
     return noreturn_src_node;
 }
 
-fn countDefers(astgen: *AstGen, outer_scope: *Scope, inner_scope: *Scope) struct {
+fn countDefers(outer_scope: *Scope, inner_scope: *Scope) struct {
     have_any: bool,
     have_normal: bool,
     have_err: bool,
     need_err_code: bool,
 } {
-    const tree = astgen.tree;
-    const node_datas = tree.nodes.items(.data);
-
     var have_normal = false;
     var have_err = false;
     var need_err_code = false;
@@ -2607,7 +2566,6 @@ fn countDefers(astgen: *AstGen, outer_scope: *Scope, inner_scope: *Scope) struct
             .gen_zir => scope = scope.cast(GenZir).?.parent,
             .local_val => scope = scope.cast(Scope.LocalVal).?.parent,
             .local_ptr => scope = scope.cast(Scope.LocalPtr).?.parent,
-            .defer_gen => scope = scope.cast(Scope.DeferGen).?.parent,
             .defer_normal => {
                 const defer_scope = scope.cast(Scope.Defer).?;
                 scope = defer_scope.parent;
@@ -2620,7 +2578,7 @@ fn countDefers(astgen: *AstGen, outer_scope: *Scope, inner_scope: *Scope) struct
 
                 have_err = true;
 
-                const have_err_payload = node_datas[defer_scope.defer_node].lhs != 0;
+                const have_err_payload = defer_scope.remapped_err_code != 0;
                 need_err_code = need_err_code or have_err_payload;
             },
             .namespace => unreachable,
@@ -2647,9 +2605,7 @@ fn genDefers(
     inner_scope: *Scope,
     which_ones: DefersToEmit,
 ) InnerError!void {
-    const astgen = gz.astgen;
-    const tree = astgen.tree;
-    const node_datas = tree.nodes.items(.data);
+    const gpa = gz.astgen.gpa;
 
     var scope = inner_scope;
     while (scope != outer_scope) {
@@ -2657,51 +2613,40 @@ fn genDefers(
             .gen_zir => scope = scope.cast(GenZir).?.parent,
             .local_val => scope = scope.cast(Scope.LocalVal).?.parent,
             .local_ptr => scope = scope.cast(Scope.LocalPtr).?.parent,
-            .defer_gen => scope = scope.cast(Scope.DeferGen).?.parent,
             .defer_normal => {
                 const defer_scope = scope.cast(Scope.Defer).?;
                 scope = defer_scope.parent;
-                const expr_node = node_datas[defer_scope.defer_node].rhs;
-                const prev_in_defer = gz.in_defer;
-                gz.in_defer = true;
-                defer gz.in_defer = prev_in_defer;
-                try unusedResultDeferExpr(gz, defer_scope, defer_scope.parent, expr_node);
+                try gz.addDefer(defer_scope.index, defer_scope.len);
             },
             .defer_error => {
                 const defer_scope = scope.cast(Scope.Defer).?;
                 scope = defer_scope.parent;
                 switch (which_ones) {
                     .both_sans_err => {
-                        const expr_node = node_datas[defer_scope.defer_node].rhs;
-                        const prev_in_defer = gz.in_defer;
-                        gz.in_defer = true;
-                        defer gz.in_defer = prev_in_defer;
-                        try unusedResultDeferExpr(gz, defer_scope, defer_scope.parent, expr_node);
+                        try gz.addDefer(defer_scope.index, defer_scope.len);
                     },
                     .both => |err_code| {
-                        const expr_node = node_datas[defer_scope.defer_node].rhs;
-                        const payload_token = node_datas[defer_scope.defer_node].lhs;
-                        const prev_in_defer = gz.in_defer;
-                        gz.in_defer = true;
-                        defer gz.in_defer = prev_in_defer;
-                        var local_val_scope: Scope.LocalVal = undefined;
-                        try gz.addDbgBlockBegin();
-                        const sub_scope = if (payload_token == 0) defer_scope.parent else blk: {
-                            const ident_name = try astgen.identAsString(payload_token);
-                            local_val_scope = .{
-                                .parent = defer_scope.parent,
-                                .gen_zir = gz,
-                                .name = ident_name,
-                                .inst = err_code,
-                                .token_src = payload_token,
-                                .id_cat = .@"capture",
-                            };
-                            try gz.addDbgVar(.dbg_var_val, ident_name, err_code);
-                            break :blk &local_val_scope.base;
-                        };
-                        try unusedResultDeferExpr(gz, defer_scope, sub_scope, expr_node);
-                        try checkUsed(gz, scope, sub_scope);
-                        try gz.addDbgBlockEnd();
+                        if (defer_scope.remapped_err_code == 0) {
+                            try gz.addDefer(defer_scope.index, defer_scope.len);
+                        } else {
+                            try gz.instructions.ensureUnusedCapacity(gpa, 1);
+                            try gz.astgen.instructions.ensureUnusedCapacity(gpa, 1);
+
+                            const payload_index = try gz.astgen.addExtra(Zir.Inst.DeferErrCode{
+                                .remapped_err_code = defer_scope.remapped_err_code,
+                                .index = defer_scope.index,
+                                .len = defer_scope.len,
+                            });
+                            const new_index = @intCast(Zir.Inst.Index, gz.astgen.instructions.len);
+                            gz.astgen.instructions.appendAssumeCapacity(.{
+                                .tag = .defer_err_code,
+                                .data = .{ .defer_err_code = .{
+                                    .err_code = err_code,
+                                    .payload_index = payload_index,
+                                } },
+                            });
+                            gz.instructions.appendAssumeCapacity(new_index);
+                        }
                     },
                     .normal_only => continue,
                 }
@@ -2712,11 +2657,7 @@ fn genDefers(
     }
 }
 
-fn checkUsed(
-    gz: *GenZir,
-    outer_scope: *Scope,
-    inner_scope: *Scope,
-) InnerError!void {
+fn checkUsed(gz: *GenZir, outer_scope: *Scope, inner_scope: *Scope) InnerError!void {
     const astgen = gz.astgen;
 
     var scope = inner_scope;
@@ -2725,48 +2666,89 @@ fn checkUsed(
             .gen_zir => scope = scope.cast(GenZir).?.parent,
             .local_val => {
                 const s = scope.cast(Scope.LocalVal).?;
-                if (!s.used) {
+                if (s.used == 0 and s.discarded == 0) {
                     try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
+                } else if (s.used != 0 and s.discarded != 0) {
+                    try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
+                        try gz.astgen.errNoteTok(s.used, "used here", .{}),
+                    });
                 }
                 scope = s.parent;
             },
             .local_ptr => {
                 const s = scope.cast(Scope.LocalPtr).?;
-                if (!s.used) {
+                if (s.used == 0 and s.discarded == 0) {
                     try astgen.appendErrorTok(s.token_src, "unused {s}", .{@tagName(s.id_cat)});
+                } else if (s.used != 0 and s.discarded != 0) {
+                    try astgen.appendErrorTokNotes(s.discarded, "pointless discard of {s}", .{@tagName(s.id_cat)}, &[_]u32{
+                        try gz.astgen.errNoteTok(s.used, "used here", .{}),
+                    });
                 }
                 scope = s.parent;
             },
             .defer_normal, .defer_error => scope = scope.cast(Scope.Defer).?.parent,
-            .defer_gen => scope = scope.cast(Scope.DeferGen).?.parent,
             .namespace => unreachable,
             .top => unreachable,
         }
     }
 }
 
-fn makeDeferScope(
-    astgen: *AstGen,
+fn deferStmt(
+    gz: *GenZir,
     scope: *Scope,
     node: Ast.Node.Index,
     block_arena: Allocator,
     scope_tag: Scope.Tag,
 ) InnerError!*Scope {
-    const tree = astgen.tree;
+    var defer_gen = gz.makeSubBlock(scope);
+    defer_gen.cur_defer_node = node;
+    defer_gen.any_defer_node = node;
+    defer defer_gen.unstack();
+
+    const tree = gz.astgen.tree;
     const node_datas = tree.nodes.items(.data);
     const expr_node = node_datas[node].rhs;
-    const token_starts = tree.tokens.items(.start);
-    const node_start = token_starts[tree.firstToken(expr_node)];
+
+    const payload_token = node_datas[node].lhs;
+    var local_val_scope: Scope.LocalVal = undefined;
+    var remapped_err_code: Zir.Inst.Index = 0;
+    const have_err_code = scope_tag == .defer_error and payload_token != 0;
+    const sub_scope = if (!have_err_code) &defer_gen.base else blk: {
+        try gz.addDbgBlockBegin();
+        const ident_name = try gz.astgen.identAsString(payload_token);
+        remapped_err_code = @intCast(u32, try gz.astgen.instructions.addOne(gz.astgen.gpa));
+        const remapped_err_code_ref = Zir.indexToRef(remapped_err_code);
+        local_val_scope = .{
+            .parent = &defer_gen.base,
+            .gen_zir = gz,
+            .name = ident_name,
+            .inst = remapped_err_code_ref,
+            .token_src = payload_token,
+            .id_cat = .@"capture",
+        };
+        try gz.addDbgVar(.dbg_var_val, ident_name, remapped_err_code_ref);
+        break :blk &local_val_scope.base;
+    };
+    _ = try unusedResultExpr(&defer_gen, sub_scope, expr_node);
+    try checkUsed(gz, scope, sub_scope);
+    if (have_err_code) try gz.addDbgBlockEnd();
+    _ = try defer_gen.addBreak(.break_inline, 0, .void_value);
+
+    const body = defer_gen.instructionsSlice();
+    const body_len = gz.astgen.countBodyLenAfterFixups(body);
+
+    const index = @intCast(u32, gz.astgen.extra.items.len);
+    try gz.astgen.extra.ensureUnusedCapacity(gz.astgen.gpa, body_len);
+    gz.astgen.appendBodyWithFixups(body);
+
     const defer_scope = try block_arena.create(Scope.Defer);
-    astgen.advanceSourceCursor(node_start);
 
     defer_scope.* = .{
         .base = .{ .tag = scope_tag },
         .parent = scope,
-        .defer_node = node,
-        .source_offset = astgen.source_offset,
-        .source_line = astgen.source_line,
-        .source_column = astgen.source_column,
+        .index = index,
+        .len = body_len,
+        .remapped_err_code = remapped_err_code,
     };
     return &defer_scope.base;
 }
@@ -2791,7 +2773,13 @@ fn varDecl(
     }
     const ident_name = try astgen.identAsString(name_token);
 
-    try astgen.detectLocalShadowing(scope, ident_name, name_token, ident_name_raw);
+    try astgen.detectLocalShadowing(
+        scope,
+        ident_name,
+        name_token,
+        ident_name_raw,
+        if (token_tags[var_decl.ast.mut_token] == .keyword_const) .@"local constant" else .@"local variable",
+    );
 
     if (var_decl.ast.init_node == 0) {
         return astgen.failNode(node, "variables must be initialized", .{});
@@ -3447,7 +3435,6 @@ fn fnDecl(
 
     var decl_gz: GenZir = .{
         .force_comptime = true,
-        .in_defer = false,
         .decl_node_index = fn_proto.ast.proto_node,
         .decl_line = astgen.source_line,
         .parent = scope,
@@ -3459,7 +3446,6 @@ fn fnDecl(
 
     var fn_gz: GenZir = .{
         .force_comptime = false,
-        .in_defer = false,
         .decl_node_index = fn_proto.ast.proto_node,
         .decl_line = decl_gz.decl_line,
         .parent = &decl_gz.base,
@@ -3523,7 +3509,7 @@ fn fnDecl(
 
                 const param_name = try astgen.identAsString(name_token);
                 if (!is_extern) {
-                    try astgen.detectLocalShadowing(params_scope, param_name, name_token, name_bytes);
+                    try astgen.detectLocalShadowing(params_scope, param_name, name_token, name_bytes, .@"function parameter");
                 }
                 break :blk param_name;
             } else if (!is_extern) {
@@ -3798,7 +3784,6 @@ fn globalVarDecl(
         .decl_line = astgen.source_line,
         .astgen = astgen,
         .force_comptime = true,
-        .in_defer = false,
         .anon_name_strategy = .parent,
         .instructions = gz.instructions,
         .instructions_top = gz.instructions.items.len,
@@ -3950,7 +3935,6 @@ fn comptimeDecl(
 
     var decl_block: GenZir = .{
         .force_comptime = true,
-        .in_defer = false,
         .decl_node_index = node,
         .decl_line = astgen.source_line,
         .parent = scope,
@@ -4005,7 +3989,6 @@ fn usingnamespaceDecl(
 
     var decl_block: GenZir = .{
         .force_comptime = true,
-        .in_defer = false,
         .decl_node_index = node,
         .decl_line = astgen.source_line,
         .parent = scope,
@@ -4053,7 +4036,6 @@ fn testDecl(
 
     var decl_block: GenZir = .{
         .force_comptime = true,
-        .in_defer = false,
         .decl_node_index = node,
         .decl_line = astgen.source_line,
         .parent = scope,
@@ -4088,6 +4070,13 @@ fn testDecl(
                             true => .signed,
                             false => .unsigned,
                         };
+                        if (ident_name_raw.len >= 3 and ident_name_raw[1] == '0') {
+                            return astgen.failTok(
+                                test_name_token,
+                                "primitive integer type '{s}' has leading zero",
+                                .{ident_name_raw},
+                            );
+                        }
                         _ = parseBitCount(ident_name_raw[1..]) catch |err| switch (err) {
                             error.Overflow => return astgen.failTok(
                                 test_name_token,
@@ -4111,7 +4100,6 @@ fn testDecl(
                 .local_val, .local_ptr => unreachable, // a test cannot be in a local scope
                 .gen_zir => s = s.cast(GenZir).?.parent,
                 .defer_normal, .defer_error => s = s.cast(Scope.Defer).?.parent,
-                .defer_gen => s = s.cast(Scope.DeferGen).?.parent,
                 .namespace => {
                     const ns = s.cast(Scope.Namespace).?;
                     if (ns.decls.get(name_str_index)) |i| {
@@ -4143,7 +4131,6 @@ fn testDecl(
 
     var fn_block: GenZir = .{
         .force_comptime = false,
-        .in_defer = false,
         .decl_node_index = node,
         .decl_line = decl_block.decl_line,
         .parent = &decl_block.base,
@@ -4261,10 +4248,9 @@ fn structDeclInner(
     var block_scope: GenZir = .{
         .parent = &namespace.base,
         .decl_node_index = node,
-        .decl_line = astgen.source_line,
+        .decl_line = gz.decl_line,
         .astgen = astgen,
         .force_comptime = true,
-        .in_defer = false,
         .instructions = gz.instructions,
         .instructions_top = gz.instructions.items.len,
     };
@@ -4462,10 +4448,9 @@ fn unionDeclInner(
     var block_scope: GenZir = .{
         .parent = &namespace.base,
         .decl_node_index = node,
-        .decl_line = astgen.source_line,
+        .decl_line = gz.decl_line,
         .astgen = astgen,
         .force_comptime = true,
-        .in_defer = false,
         .instructions = gz.instructions,
         .instructions_top = gz.instructions.items.len,
     };
@@ -4556,9 +4541,6 @@ fn unionDeclInner(
             const tag_value = try expr(&block_scope, &block_scope.base, .{ .ty = arg_inst }, member.ast.value_expr);
             wip_members.appendToField(@enumToInt(tag_value));
         }
-    }
-    if (field_count == 0) {
-        return astgen.failNode(node, "union declarations must have at least one tag", .{});
     }
 
     if (!block_scope.isEmpty()) {
@@ -4715,12 +4697,6 @@ fn containerDecl(
                     .nonexhaustive_node = nonexhaustive_node,
                 };
             };
-            if (counts.total_fields == 0 and counts.nonexhaustive_node == 0) {
-                // One can construct an enum with no tags, and it functions the same as `noreturn`. But
-                // this is only useful for generic code; when explicitly using `enum {}` syntax, there
-                // must be at least one tag.
-                try astgen.appendErrorNode(node, "enum declarations must have at least one tag", .{});
-            }
             if (counts.nonexhaustive_node != 0 and container_decl.ast.arg == 0) {
                 try astgen.appendErrorNodeNotes(
                     node,
@@ -4755,10 +4731,9 @@ fn containerDecl(
             var block_scope: GenZir = .{
                 .parent = &namespace.base,
                 .decl_node_index = node,
-                .decl_line = astgen.source_line,
+                .decl_line = gz.decl_line,
                 .astgen = astgen,
                 .force_comptime = true,
-                .in_defer = false,
                 .instructions = gz.instructions,
                 .instructions_top = gz.instructions.items.len,
             };
@@ -4861,10 +4836,9 @@ fn containerDecl(
             var block_scope: GenZir = .{
                 .parent = &namespace.base,
                 .decl_node_index = node,
-                .decl_line = astgen.source_line,
+                .decl_line = gz.decl_line,
                 .astgen = astgen,
                 .force_comptime = true,
-                .in_defer = false,
                 .instructions = gz.instructions,
                 .instructions_top = gz.instructions.items.len,
             };
@@ -5095,7 +5069,15 @@ fn tryExpr(
         return astgen.failNode(node, "'try' outside function scope", .{});
     };
 
-    if (parent_gz.in_defer) return astgen.failNode(node, "'try' not allowed inside defer expression", .{});
+    if (parent_gz.any_defer_node != 0) {
+        return astgen.failNodeNotes(node, "'try' not allowed inside defer expression", .{}, &.{
+            try astgen.errNoteNode(
+                parent_gz.any_defer_node,
+                "defer expression here",
+                .{},
+            ),
+        });
+    }
 
     // Ensure debug line/column information is emitted for this try expression.
     // Then we will save the line/column so that we can emit another one that goes
@@ -5112,7 +5094,7 @@ fn tryExpr(
         else => .none,
     };
     // This could be a pointer or value depending on the `rl` parameter.
-    const operand = try expr(parent_gz, scope, operand_rl, operand_node);
+    const operand = try reachableExpr(parent_gz, scope, operand_rl, operand_node, node);
     const is_inline = parent_gz.force_comptime;
     const is_inline_bit = @as(u2, @boolToInt(is_inline));
     const is_ptr_bit = @as(u2, @boolToInt(operand_rl == .ref)) << 1;
@@ -5206,7 +5188,7 @@ fn orelseCatchExpr(
         }
         const err_name = try astgen.identAsString(payload);
 
-        try astgen.detectLocalShadowing(scope, err_name, payload, err_str);
+        try astgen.detectLocalShadowing(scope, err_name, payload, err_str, .@"capture");
 
         err_val_scope = .{
             .parent = &else_scope.base,
@@ -5505,7 +5487,7 @@ fn ifExpr(
                 const token_name_str = tree.tokenSlice(token_name_index);
                 if (mem.eql(u8, "_", token_name_str))
                     break :s &then_scope.base;
-                try astgen.detectLocalShadowing(&then_scope.base, ident_name, token_name_index, token_name_str);
+                try astgen.detectLocalShadowing(&then_scope.base, ident_name, token_name_index, token_name_str, .@"capture");
                 payload_val_scope = .{
                     .parent = &then_scope.base,
                     .gen_zir = &then_scope,
@@ -5517,6 +5499,7 @@ fn ifExpr(
                 try then_scope.addDbgVar(.dbg_var_val, ident_name, payload_inst);
                 break :s &payload_val_scope.base;
             } else {
+                _ = try then_scope.addUnNode(.ensure_err_union_payload_void, cond.inst, node);
                 break :s &then_scope.base;
             }
         } else if (if_full.payload_token) |payload_token| {
@@ -5530,7 +5513,7 @@ fn ifExpr(
                 break :s &then_scope.base;
             const payload_inst = try then_scope.addUnNode(tag, cond.inst, if_full.ast.then_expr);
             const ident_name = try astgen.identAsString(ident_token);
-            try astgen.detectLocalShadowing(&then_scope.base, ident_name, ident_token, ident_bytes);
+            try astgen.detectLocalShadowing(&then_scope.base, ident_name, ident_token, ident_bytes, .@"capture");
             payload_val_scope = .{
                 .parent = &then_scope.base,
                 .gen_zir = &then_scope,
@@ -5576,7 +5559,7 @@ fn ifExpr(
                 const error_token_str = tree.tokenSlice(error_token);
                 if (mem.eql(u8, "_", error_token_str))
                     break :s &else_scope.base;
-                try astgen.detectLocalShadowing(&else_scope.base, ident_name, error_token, error_token_str);
+                try astgen.detectLocalShadowing(&else_scope.base, ident_name, error_token, error_token_str, .@"capture");
                 payload_val_scope = .{
                     .parent = &else_scope.base,
                     .gen_zir = &else_scope,
@@ -5603,7 +5586,11 @@ fn ifExpr(
         };
     } else .{
         .src = if_full.ast.then_expr,
-        .result = .none,
+        .result = switch (rl) {
+            // Explicitly store void to ptr result loc if there is no else branch
+            .ptr, .block_ptr => try rvalue(&else_scope, rl, .void_value, node),
+            else => .none,
+        },
     };
 
     const break_tag: Zir.Inst.Tag = if (parent_gz.force_comptime) .break_inline else .@"break";
@@ -5815,7 +5802,6 @@ fn whileExpr(
     // make scope now but don't stack on parent_gz until loop_scope
     // gets unstacked after cont_expr is emitted and added below
     var then_scope = parent_gz.makeSubBlock(&continue_scope.base);
-    then_scope.markAsLoopBody(loop_scope);
     then_scope.instructions_top = GenZir.unstacked_top;
     defer then_scope.unstack();
 
@@ -5838,7 +5824,7 @@ fn whileExpr(
                     break :s &then_scope.base;
                 const payload_name_loc = payload_token + @boolToInt(payload_is_ref);
                 const ident_name = try astgen.identAsString(payload_name_loc);
-                try astgen.detectLocalShadowing(&then_scope.base, ident_name, payload_name_loc, ident_bytes);
+                try astgen.detectLocalShadowing(&then_scope.base, ident_name, payload_name_loc, ident_bytes, .@"capture");
                 payload_val_scope = .{
                     .parent = &then_scope.base,
                     .gen_zir = &then_scope,
@@ -5851,6 +5837,7 @@ fn whileExpr(
                 dbg_var_inst = indexToRef(payload_inst);
                 break :s &payload_val_scope.base;
             } else {
+                _ = try then_scope.addUnNode(.ensure_err_union_payload_void, cond.inst, node);
                 break :s &then_scope.base;
             }
         } else if (while_full.payload_token) |payload_token| {
@@ -5865,7 +5852,7 @@ fn whileExpr(
             const ident_bytes = tree.tokenSlice(ident_token);
             if (mem.eql(u8, "_", ident_bytes))
                 break :s &then_scope.base;
-            try astgen.detectLocalShadowing(&then_scope.base, ident_name, ident_token, ident_bytes);
+            try astgen.detectLocalShadowing(&then_scope.base, ident_name, ident_token, ident_bytes, .@"capture");
             payload_val_scope = .{
                 .parent = &then_scope.base,
                 .gen_zir = &then_scope,
@@ -5915,7 +5902,7 @@ fn whileExpr(
     if (dbg_var_name) |some| {
         try then_scope.addDbgVar(.dbg_var_val, some, dbg_var_inst);
     }
-    const then_result = try expr(&then_scope, then_sub_scope, loop_scope.break_result_loc, while_full.ast.then_expr);
+    const then_result = try expr(&then_scope, then_sub_scope, .none, while_full.ast.then_expr);
     _ = try addEnsureResult(&then_scope, then_result, while_full.ast.then_expr);
 
     try checkUsed(parent_gz, &then_scope.base, then_sub_scope);
@@ -5941,7 +5928,7 @@ fn whileExpr(
                 const ident_bytes = tree.tokenSlice(error_token);
                 if (mem.eql(u8, ident_bytes, "_"))
                     break :s &else_scope.base;
-                try astgen.detectLocalShadowing(&else_scope.base, ident_name, error_token, ident_bytes);
+                try astgen.detectLocalShadowing(&else_scope.base, ident_name, error_token, ident_bytes, .@"capture");
                 payload_val_scope = .{
                     .parent = &else_scope.base,
                     .gen_zir = &else_scope,
@@ -6093,7 +6080,6 @@ fn forExpr(
     }
 
     var then_scope = parent_gz.makeSubBlock(&cond_scope.base);
-    then_scope.markAsLoopBody(loop_scope);
     defer then_scope.unstack();
 
     try then_scope.addDbgBlockBegin();
@@ -6115,7 +6101,7 @@ fn forExpr(
                 .lhs = array_ptr,
                 .rhs = index,
             });
-            try astgen.detectLocalShadowing(&then_scope.base, name_str_index, ident, value_name);
+            try astgen.detectLocalShadowing(&then_scope.base, name_str_index, ident, value_name, .@"capture");
             payload_val_scope = .{
                 .parent = &then_scope.base,
                 .gen_zir = &then_scope,
@@ -6141,7 +6127,7 @@ fn forExpr(
             return astgen.failTok(index_token, "discard of index capture; omit it instead", .{});
         }
         const index_name = try astgen.identAsString(index_token);
-        try astgen.detectLocalShadowing(payload_sub_scope, index_name, index_token, token_bytes);
+        try astgen.detectLocalShadowing(payload_sub_scope, index_name, index_token, token_bytes, .@"loop index capture");
         index_scope = .{
             .parent = payload_sub_scope,
             .gen_zir = &then_scope,
@@ -6155,7 +6141,7 @@ fn forExpr(
         break :blk &index_scope.base;
     };
 
-    const then_result = try expr(&then_scope, then_sub_scope, loop_scope.break_result_loc, for_full.ast.then_expr);
+    const then_result = try expr(&then_scope, then_sub_scope, .none, for_full.ast.then_expr);
     _ = try addEnsureResult(&then_scope, then_result, for_full.ast.then_expr);
 
     try checkUsed(parent_gz, &then_scope.base, then_sub_scope);
@@ -6241,14 +6227,15 @@ fn switchExpr(
     var any_payload_is_ref = false;
     var scalar_cases_len: u32 = 0;
     var multi_cases_len: u32 = 0;
+    var inline_cases_len: u32 = 0;
     var special_prong: Zir.SpecialProng = .none;
     var special_node: Ast.Node.Index = 0;
     var else_src: ?Ast.TokenIndex = null;
     var underscore_src: ?Ast.TokenIndex = null;
     for (case_nodes) |case_node| {
         const case = switch (node_tags[case_node]) {
-            .switch_case_one => tree.switchCaseOne(case_node),
-            .switch_case => tree.switchCase(case_node),
+            .switch_case_one, .switch_case_inline_one => tree.switchCaseOne(case_node),
+            .switch_case, .switch_case_inline => tree.switchCase(case_node),
             else => unreachable,
         };
         if (case.payload_token) |payload_token| {
@@ -6332,6 +6319,9 @@ fn switchExpr(
                     },
                 );
             }
+            if (case.inline_token != null) {
+                return astgen.failTok(case_src, "cannot inline '_' prong", .{});
+            }
             special_node = case_node;
             special_prong = .under;
             underscore_src = case_src;
@@ -6342,6 +6332,9 @@ fn switchExpr(
             scalar_cases_len += 1;
         } else {
             multi_cases_len += 1;
+        }
+        if (case.inline_token != null) {
+            inline_cases_len += 1;
         }
     }
 
@@ -6382,8 +6375,8 @@ fn switchExpr(
     var scalar_case_index: u32 = 0;
     for (case_nodes) |case_node| {
         const case = switch (node_tags[case_node]) {
-            .switch_case_one => tree.switchCaseOne(case_node),
-            .switch_case => tree.switchCase(case_node),
+            .switch_case_one, .switch_case_inline_one => tree.switchCaseOne(case_node),
+            .switch_case, .switch_case_inline => tree.switchCase(case_node),
             else => unreachable,
         };
 
@@ -6392,8 +6385,12 @@ fn switchExpr(
 
         var dbg_var_name: ?u32 = null;
         var dbg_var_inst: Zir.Inst.Ref = undefined;
+        var dbg_var_tag_name: ?u32 = null;
+        var dbg_var_tag_inst: Zir.Inst.Ref = undefined;
         var capture_inst: Zir.Inst.Index = 0;
+        var tag_inst: Zir.Inst.Index = 0;
         var capture_val_scope: Scope.LocalVal = undefined;
+        var tag_scope: Scope.LocalVal = undefined;
         const sub_scope = blk: {
             const payload_token = case.payload_token orelse break :blk &case_scope.base;
             const ident = if (token_tags[payload_token] == .asterisk)
@@ -6401,59 +6398,96 @@ fn switchExpr(
             else
                 payload_token;
             const is_ptr = ident != payload_token;
-            if (mem.eql(u8, tree.tokenSlice(ident), "_")) {
+            const ident_slice = tree.tokenSlice(ident);
+            var payload_sub_scope: *Scope = undefined;
+            if (mem.eql(u8, ident_slice, "_")) {
                 if (is_ptr) {
                     return astgen.failTok(payload_token, "pointer modifier invalid on discard", .{});
                 }
-                break :blk &case_scope.base;
-            }
-            if (case_node == special_node) {
-                const capture_tag: Zir.Inst.Tag = if (is_ptr)
-                    .switch_capture_ref
-                else
-                    .switch_capture;
-                capture_inst = @intCast(Zir.Inst.Index, astgen.instructions.len);
-                try astgen.instructions.append(gpa, .{
-                    .tag = capture_tag,
-                    .data = .{
-                        .switch_capture = .{
-                            .switch_inst = switch_block,
-                            // Max int communicates that this is the else/underscore prong.
-                            .prong_index = std.math.maxInt(u32),
-                        },
-                    },
-                });
+                payload_sub_scope = &case_scope.base;
             } else {
-                const is_multi_case_bits: u2 = @boolToInt(is_multi_case);
-                const is_ptr_bits: u2 = @boolToInt(is_ptr);
-                const capture_tag: Zir.Inst.Tag = switch ((is_multi_case_bits << 1) | is_ptr_bits) {
-                    0b00 => .switch_capture,
-                    0b01 => .switch_capture_ref,
-                    0b10 => .switch_capture_multi,
-                    0b11 => .switch_capture_multi_ref,
+                if (case_node == special_node) {
+                    const capture_tag: Zir.Inst.Tag = if (is_ptr)
+                        .switch_capture_ref
+                    else
+                        .switch_capture;
+                    capture_inst = @intCast(Zir.Inst.Index, astgen.instructions.len);
+                    try astgen.instructions.append(gpa, .{
+                        .tag = capture_tag,
+                        .data = .{
+                            .switch_capture = .{
+                                .switch_inst = switch_block,
+                                // Max int communicates that this is the else/underscore prong.
+                                .prong_index = std.math.maxInt(u32),
+                            },
+                        },
+                    });
+                } else {
+                    const is_multi_case_bits: u2 = @boolToInt(is_multi_case);
+                    const is_ptr_bits: u2 = @boolToInt(is_ptr);
+                    const capture_tag: Zir.Inst.Tag = switch ((is_multi_case_bits << 1) | is_ptr_bits) {
+                        0b00 => .switch_capture,
+                        0b01 => .switch_capture_ref,
+                        0b10 => .switch_capture_multi,
+                        0b11 => .switch_capture_multi_ref,
+                    };
+                    const capture_index = if (is_multi_case) multi_case_index else scalar_case_index;
+                    capture_inst = @intCast(Zir.Inst.Index, astgen.instructions.len);
+                    try astgen.instructions.append(gpa, .{
+                        .tag = capture_tag,
+                        .data = .{ .switch_capture = .{
+                            .switch_inst = switch_block,
+                            .prong_index = capture_index,
+                        } },
+                    });
+                }
+                const capture_name = try astgen.identAsString(ident);
+                try astgen.detectLocalShadowing(&case_scope.base, capture_name, ident, ident_slice, .@"capture");
+                capture_val_scope = .{
+                    .parent = &case_scope.base,
+                    .gen_zir = &case_scope,
+                    .name = capture_name,
+                    .inst = indexToRef(capture_inst),
+                    .token_src = payload_token,
+                    .id_cat = .@"capture",
                 };
-                const capture_index = if (is_multi_case) multi_case_index else scalar_case_index;
-                capture_inst = @intCast(Zir.Inst.Index, astgen.instructions.len);
-                try astgen.instructions.append(gpa, .{
-                    .tag = capture_tag,
-                    .data = .{ .switch_capture = .{
-                        .switch_inst = switch_block,
-                        .prong_index = capture_index,
-                    } },
-                });
+                dbg_var_name = capture_name;
+                dbg_var_inst = indexToRef(capture_inst);
+                payload_sub_scope = &capture_val_scope.base;
             }
-            const capture_name = try astgen.identAsString(ident);
-            capture_val_scope = .{
-                .parent = &case_scope.base,
+
+            const tag_token = if (token_tags[ident + 1] == .comma)
+                ident + 2
+            else
+                break :blk payload_sub_scope;
+            const tag_slice = tree.tokenSlice(tag_token);
+            if (mem.eql(u8, tag_slice, "_")) {
+                return astgen.failTok(tag_token, "discard of tag capture; omit it instead", .{});
+            } else if (case.inline_token == null) {
+                return astgen.failTok(tag_token, "tag capture on non-inline prong", .{});
+            }
+            const tag_name = try astgen.identAsString(tag_token);
+            try astgen.detectLocalShadowing(payload_sub_scope, tag_name, tag_token, tag_slice, .@"switch tag capture");
+            tag_inst = @intCast(Zir.Inst.Index, astgen.instructions.len);
+            try astgen.instructions.append(gpa, .{
+                .tag = .switch_capture_tag,
+                .data = .{ .un_tok = .{
+                    .operand = cond,
+                    .src_tok = case_scope.tokenIndexToRelative(tag_token),
+                } },
+            });
+
+            tag_scope = .{
+                .parent = payload_sub_scope,
                 .gen_zir = &case_scope,
-                .name = capture_name,
-                .inst = indexToRef(capture_inst),
-                .token_src = payload_token,
-                .id_cat = .@"capture",
+                .name = tag_name,
+                .inst = indexToRef(tag_inst),
+                .token_src = tag_token,
+                .id_cat = .@"switch tag capture",
             };
-            dbg_var_name = capture_name;
-            dbg_var_inst = indexToRef(capture_inst);
-            break :blk &capture_val_scope.base;
+            dbg_var_tag_name = tag_name;
+            dbg_var_tag_inst = indexToRef(tag_inst);
+            break :blk &tag_scope.base;
         };
 
         const header_index = @intCast(u32, payloads.items.len);
@@ -6508,9 +6542,13 @@ fn switchExpr(
             defer case_scope.unstack();
 
             if (capture_inst != 0) try case_scope.instructions.append(gpa, capture_inst);
+            if (tag_inst != 0) try case_scope.instructions.append(gpa, tag_inst);
             try case_scope.addDbgBlockBegin();
             if (dbg_var_name) |some| {
                 try case_scope.addDbgVar(.dbg_var_val, some, dbg_var_inst);
+            }
+            if (dbg_var_tag_name) |some| {
+                try case_scope.addDbgVar(.dbg_var_val, some, dbg_var_tag_inst);
             }
             const case_result = try expr(&case_scope, sub_scope, block_scope.break_result_loc, case.ast.target_expr);
             try checkUsed(parent_gz, &case_scope.base, sub_scope);
@@ -6523,7 +6561,8 @@ fn switchExpr(
             const case_slice = case_scope.instructionsSlice();
             const body_len = astgen.countBodyLenAfterFixups(case_slice);
             try payloads.ensureUnusedCapacity(gpa, body_len);
-            payloads.items[body_len_index] = body_len;
+            const inline_bit = @as(u32, @boolToInt(case.inline_token != null)) << 31;
+            payloads.items[body_len_index] = body_len | inline_bit;
             appendBodyWithFixupsArrayList(astgen, payloads, case_slice);
         }
     }
@@ -6537,7 +6576,6 @@ fn switchExpr(
     const payload_index = astgen.addExtraAssumeCapacity(Zir.Inst.SwitchBlock{
         .operand = cond,
         .bits = Zir.Inst.SwitchBlock.Bits{
-            .is_ref = any_payload_is_ref,
             .has_multi_cases = multi_cases_len != 0,
             .has_else = special_prong == .@"else",
             .has_under = special_prong == .under,
@@ -6571,7 +6609,7 @@ fn switchExpr(
             end_index += 3 + items_len + 2 * ranges_len;
         }
 
-        const body_len = payloads.items[body_len_index];
+        const body_len = @truncate(u31, payloads.items[body_len_index]);
         end_index += body_len;
 
         switch (strat.tag) {
@@ -6641,7 +6679,15 @@ fn ret(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Inst.Ref
         return astgen.failNode(node, "'return' outside function scope", .{});
     }
 
-    if (gz.in_defer) return astgen.failNode(node, "cannot return from defer expression", .{});
+    if (gz.any_defer_node != 0) {
+        return astgen.failNodeNotes(node, "cannot return from defer expression", .{}, &.{
+            try astgen.errNoteNode(
+                gz.any_defer_node,
+                "defer expression here",
+                .{},
+            ),
+        });
+    }
 
     // Ensure debug line/column information is emitted for this return expression.
     // Then we will save the line/column so that we can emit another one that goes
@@ -6668,7 +6714,7 @@ fn ret(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Inst.Ref
         // for detecting whether to add something to the function's inferred error set.
         const ident_token = node_datas[operand_node].rhs;
         const err_name_str_index = try astgen.identAsString(ident_token);
-        const defer_counts = countDefers(astgen, defer_outer, scope);
+        const defer_counts = countDefers(defer_outer, scope);
         if (!defer_counts.need_err_code) {
             try genDefers(gz, defer_outer, scope, .both_sans_err);
             try emitDbgStmt(gz, ret_line, ret_column);
@@ -6709,7 +6755,7 @@ fn ret(gz: *GenZir, scope: *Scope, node: Ast.Node.Index) InnerError!Zir.Inst.Ref
             return Zir.Inst.Ref.unreachable_value;
         },
         .maybe => {
-            const defer_counts = countDefers(astgen, defer_outer, scope);
+            const defer_counts = countDefers(defer_outer, scope);
             if (!defer_counts.have_err) {
                 // Only regular defers; no branch needed.
                 try genDefers(gz, defer_outer, scope, .normal_only);
@@ -6800,6 +6846,13 @@ fn identifier(
                     true => .signed,
                     false => .unsigned,
                 };
+                if (ident_name_raw.len >= 3 and ident_name_raw[1] == '0') {
+                    return astgen.failNode(
+                        ident,
+                        "primitive integer type '{s}' has leading zero",
+                        .{ident_name_raw},
+                    );
+                }
                 const bit_count = parseBitCount(ident_name_raw[1..]) catch |err| switch (err) {
                     error.Overflow => return astgen.failNode(
                         ident,
@@ -6830,11 +6883,10 @@ fn localVarRef(
     scope: *Scope,
     rl: ResultLoc,
     ident: Ast.Node.Index,
-    ident_token: Ast.Node.Index,
+    ident_token: Ast.TokenIndex,
 ) InnerError!Zir.Inst.Ref {
     const astgen = gz.astgen;
     const gpa = astgen.gpa;
-
     const name_str_index = try astgen.identAsString(ident_token);
     var s = scope;
     var found_already: ?Ast.Node.Index = null; // we have found a decl with the same name already
@@ -6847,7 +6899,11 @@ fn localVarRef(
             if (local_val.name == name_str_index) {
                 // Locals cannot shadow anything, so we do not need to look for ambiguous
                 // references in this case.
-                local_val.used = true;
+                if (rl == .discard) {
+                    local_val.discarded = ident_token;
+                } else {
+                    local_val.used = ident_token;
+                }
 
                 const value_inst = try tunnelThroughClosure(
                     gz,
@@ -6866,7 +6922,11 @@ fn localVarRef(
         .local_ptr => {
             const local_ptr = s.cast(Scope.LocalPtr).?;
             if (local_ptr.name == name_str_index) {
-                local_ptr.used = true;
+                if (rl == .discard) {
+                    local_ptr.discarded = ident_token;
+                } else {
+                    local_ptr.used = ident_token;
+                }
 
                 // Can't close over a runtime variable
                 if (num_namespaces_out != 0 and !local_ptr.maybe_comptime) {
@@ -6899,7 +6959,6 @@ fn localVarRef(
         },
         .gen_zir => s = s.cast(GenZir).?.parent,
         .defer_normal, .defer_error => s = s.cast(Scope.Defer).?.parent,
-        .defer_gen => s = s.cast(Scope.DeferGen).?.parent,
         .namespace => {
             const ns = s.cast(Scope.Namespace).?;
             if (ns.decls.get(name_str_index)) |i| {
@@ -7024,86 +7083,101 @@ fn charLiteral(gz: *GenZir, rl: ResultLoc, node: Ast.Node.Index) InnerError!Zir.
     }
 }
 
-fn integerLiteral(gz: *GenZir, rl: ResultLoc, node: Ast.Node.Index) InnerError!Zir.Inst.Ref {
-    const astgen = gz.astgen;
-    const tree = astgen.tree;
-    const main_tokens = tree.nodes.items(.main_token);
-    const int_token = main_tokens[node];
-    const prefixed_bytes = tree.tokenSlice(int_token);
-    if (std.fmt.parseInt(u64, prefixed_bytes, 0)) |small_int| {
-        const result: Zir.Inst.Ref = switch (small_int) {
-            0 => .zero,
-            1 => .one,
-            else => try gz.addInt(small_int),
-        };
-        return rvalue(gz, rl, result, node);
-    } else |err| switch (err) {
-        error.InvalidCharacter => unreachable, // Caught by the parser.
-        error.Overflow => {},
-    }
-
-    var base: u8 = 10;
-    var non_prefixed: []const u8 = prefixed_bytes;
-    if (mem.startsWith(u8, prefixed_bytes, "0x")) {
-        base = 16;
-        non_prefixed = prefixed_bytes[2..];
-    } else if (mem.startsWith(u8, prefixed_bytes, "0o")) {
-        base = 8;
-        non_prefixed = prefixed_bytes[2..];
-    } else if (mem.startsWith(u8, prefixed_bytes, "0b")) {
-        base = 2;
-        non_prefixed = prefixed_bytes[2..];
-    }
-
-    const gpa = astgen.gpa;
-    var big_int = try std.math.big.int.Managed.init(gpa);
-    defer big_int.deinit();
-    big_int.setString(base, non_prefixed) catch |err| switch (err) {
-        error.InvalidCharacter => unreachable, // caught by parser
-        error.InvalidBase => unreachable, // we only pass 16, 8, 2, see above
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-
-    const limbs = big_int.limbs[0..big_int.len()];
-    assert(big_int.isPositive());
-    const result = try gz.addIntBig(limbs);
-    return rvalue(gz, rl, result, node);
-}
-
 const Sign = enum { negative, positive };
 
-fn floatLiteral(gz: *GenZir, rl: ResultLoc, node: Ast.Node.Index, sign: Sign) InnerError!Zir.Inst.Ref {
+fn numberLiteral(gz: *GenZir, rl: ResultLoc, node: Ast.Node.Index, source_node: Ast.Node.Index, sign: Sign) InnerError!Zir.Inst.Ref {
     const astgen = gz.astgen;
     const tree = astgen.tree;
     const main_tokens = tree.nodes.items(.main_token);
+    const num_token = main_tokens[node];
+    const bytes = tree.tokenSlice(num_token);
 
-    const main_token = main_tokens[node];
-    const bytes = tree.tokenSlice(main_token);
-    const unsigned_float_number = std.fmt.parseFloat(f128, bytes) catch |err| switch (err) {
-        error.InvalidCharacter => unreachable, // validated by tokenizer
+    const result: Zir.Inst.Ref = switch (std.zig.parseNumberLiteral(bytes)) {
+        .int => |num| switch (num) {
+            0 => .zero,
+            1 => .one,
+            else => try gz.addInt(num),
+        },
+        .big_int => |base| big: {
+            const gpa = astgen.gpa;
+            var big_int = try std.math.big.int.Managed.init(gpa);
+            defer big_int.deinit();
+            const prefix_offset = @as(u8, 2) * @boolToInt(base != .decimal);
+            big_int.setString(@enumToInt(base), bytes[prefix_offset..]) catch |err| switch (err) {
+                error.InvalidCharacter => unreachable, // caught in `parseNumberLiteral`
+                error.InvalidBase => unreachable, // we only pass 16, 8, 2, see above
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+
+            const limbs = big_int.limbs[0..big_int.len()];
+            assert(big_int.isPositive());
+            break :big try gz.addIntBig(limbs);
+        },
+        .float => {
+            const unsigned_float_number = std.fmt.parseFloat(f128, bytes) catch |err| switch (err) {
+                error.InvalidCharacter => unreachable, // validated by tokenizer
+            };
+            const float_number = switch (sign) {
+                .negative => -unsigned_float_number,
+                .positive => unsigned_float_number,
+            };
+            // If the value fits into a f64 without losing any precision, store it that way.
+            @setFloatMode(.Strict);
+            const smaller_float = @floatCast(f64, float_number);
+            const bigger_again: f128 = smaller_float;
+            if (bigger_again == float_number) {
+                const result = try gz.addFloat(smaller_float);
+                return rvalue(gz, rl, result, source_node);
+            }
+            // We need to use 128 bits. Break the float into 4 u32 values so we can
+            // put it into the `extra` array.
+            const int_bits = @bitCast(u128, float_number);
+            const result = try gz.addPlNode(.float128, node, Zir.Inst.Float128{
+                .piece0 = @truncate(u32, int_bits),
+                .piece1 = @truncate(u32, int_bits >> 32),
+                .piece2 = @truncate(u32, int_bits >> 64),
+                .piece3 = @truncate(u32, int_bits >> 96),
+            });
+            return rvalue(gz, rl, result, source_node);
+        },
+        .failure => |err| return astgen.failWithNumberError(err, num_token, bytes),
     };
-    const float_number = switch (sign) {
-        .negative => -unsigned_float_number,
-        .positive => unsigned_float_number,
-    };
-    // If the value fits into a f64 without losing any precision, store it that way.
-    @setFloatMode(.Strict);
-    const smaller_float = @floatCast(f64, float_number);
-    const bigger_again: f128 = smaller_float;
-    if (bigger_again == float_number) {
-        const result = try gz.addFloat(smaller_float);
-        return rvalue(gz, rl, result, node);
+
+    if (sign == .positive) {
+        return rvalue(gz, rl, result, source_node);
+    } else {
+        const negated = try gz.addUnNode(.negate, result, source_node);
+        return rvalue(gz, rl, negated, source_node);
     }
-    // We need to use 128 bits. Break the float into 4 u32 values so we can
-    // put it into the `extra` array.
-    const int_bits = @bitCast(u128, float_number);
-    const result = try gz.addPlNode(.float128, node, Zir.Inst.Float128{
-        .piece0 = @truncate(u32, int_bits),
-        .piece1 = @truncate(u32, int_bits >> 32),
-        .piece2 = @truncate(u32, int_bits >> 64),
-        .piece3 = @truncate(u32, int_bits >> 96),
-    });
-    return rvalue(gz, rl, result, node);
+}
+
+fn failWithNumberError(astgen: *AstGen, err: std.zig.number_literal.Error, token: Ast.TokenIndex, bytes: []const u8) InnerError {
+    const is_float = std.mem.indexOfScalar(u8, bytes, '.') != null;
+    switch (err) {
+        .leading_zero => if (is_float) {
+            return astgen.failTok(token, "number '{s}' has leading zero", .{bytes});
+        } else {
+            return astgen.failTokNotes(token, "number '{s}' has leading zero", .{bytes}, &.{
+                try astgen.errNoteTok(token, "use '0o' prefix for octal literals", .{}),
+            });
+        },
+        .digit_after_base => return astgen.failTok(token, "expected a digit after base prefix", .{}),
+        .upper_case_base => |i| return astgen.failOff(token, @intCast(u32, i), "base prefix must be lowercase", .{}),
+        .invalid_float_base => |i| return astgen.failOff(token, @intCast(u32, i), "invalid base for float literal", .{}),
+        .repeated_underscore => |i| return astgen.failOff(token, @intCast(u32, i), "repeated digit separator", .{}),
+        .invalid_underscore_after_special => |i| return astgen.failOff(token, @intCast(u32, i), "expected digit before digit separator", .{}),
+        .invalid_digit => |info| return astgen.failOff(token, @intCast(u32, info.i), "invalid digit '{c}' for {s} base", .{ bytes[info.i], @tagName(info.base) }),
+        .invalid_digit_exponent => |i| return astgen.failOff(token, @intCast(u32, i), "invalid digit '{c}' in exponent", .{bytes[i]}),
+        .duplicate_exponent => |i| return astgen.failOff(token, @intCast(u32, i), "duplicate exponent", .{}),
+        .invalid_hex_exponent => |i| return astgen.failOff(token, @intCast(u32, i), "hex exponent in decimal float", .{}),
+        .exponent_after_underscore => |i| return astgen.failOff(token, @intCast(u32, i), "expected digit before exponent", .{}),
+        .special_after_underscore => |i| return astgen.failOff(token, @intCast(u32, i), "expected digit before '{c}'", .{bytes[i]}),
+        .trailing_special => |i| return astgen.failOff(token, @intCast(u32, i), "expected digit after '{c}'", .{bytes[i - 1]}),
+        .trailing_underscore => |i| return astgen.failOff(token, @intCast(u32, i), "trailing digit separator", .{}),
+        .duplicate_period => unreachable, // Validated by tokenizer
+        .invalid_character => unreachable, // Validated by tokenizer
+        .invalid_exponent_sign => unreachable, // Validated by tokenizer
+    }
 }
 
 fn asmExpr(
@@ -7259,7 +7333,7 @@ fn as(
 ) InnerError!Zir.Inst.Ref {
     const dest_type = try typeExpr(gz, scope, lhs);
     switch (rl) {
-        .none, .discard, .ref, .ty, .coerced_ty => {
+        .none, .discard, .ref, .ty, .ty_shift_operand, .coerced_ty => {
             const result = try reachableExpr(gz, scope, .{ .ty = dest_type }, rhs, node);
             return rvalue(gz, rl, result, node);
         },
@@ -7495,7 +7569,7 @@ fn builtinCall(
                         .local_val => {
                             const local_val = s.cast(Scope.LocalVal).?;
                             if (local_val.name == decl_name) {
-                                local_val.used = true;
+                                local_val.used = ident_token;
                                 _ = try gz.addPlNode(.export_value, node, Zir.Inst.ExportValue{
                                     .operand = local_val.inst,
                                     .options = try comptimeExpr(gz, scope, .{ .coerced_ty = .export_options_type }, params[1]),
@@ -7509,7 +7583,7 @@ fn builtinCall(
                             if (local_ptr.name == decl_name) {
                                 if (!local_ptr.maybe_comptime)
                                     return astgen.failNode(params[0], "unable to export runtime-known value", .{});
-                                local_ptr.used = true;
+                                local_ptr.used = ident_token;
                                 const loaded = try gz.addUnNode(.load, local_ptr.ptr, node);
                                 _ = try gz.addPlNode(.export_value, node, Zir.Inst.ExportValue{
                                     .operand = loaded,
@@ -7521,7 +7595,6 @@ fn builtinCall(
                         },
                         .gen_zir => s = s.cast(GenZir).?.parent,
                         .defer_normal, .defer_error => s = s.cast(Scope.Defer).?.parent,
-                        .defer_gen => s = s.cast(Scope.DeferGen).?.parent,
                         .namespace => {
                             const ns = s.cast(Scope.Namespace).?;
                             if (ns.decls.get(decl_name)) |i| {
@@ -7721,11 +7794,11 @@ fn builtinCall(
         .has_decl  => return hasDeclOrField(gz, scope, rl, node, params[0], params[1], .has_decl),
         .has_field => return hasDeclOrField(gz, scope, rl, node, params[0], params[1], .has_field),
 
-        .clz         => return bitBuiltin(gz, scope, rl, node, params[0], params[1], .clz),
-        .ctz         => return bitBuiltin(gz, scope, rl, node, params[0], params[1], .ctz),
-        .pop_count   => return bitBuiltin(gz, scope, rl, node, params[0], params[1], .pop_count),
-        .byte_swap   => return bitBuiltin(gz, scope, rl, node, params[0], params[1], .byte_swap),
-        .bit_reverse => return bitBuiltin(gz, scope, rl, node, params[0], params[1], .bit_reverse),
+        .clz         => return bitBuiltin(gz, scope, rl, node, params[0], .clz),
+        .ctz         => return bitBuiltin(gz, scope, rl, node, params[0], .ctz),
+        .pop_count   => return bitBuiltin(gz, scope, rl, node, params[0], .pop_count),
+        .byte_swap   => return bitBuiltin(gz, scope, rl, node, params[0], .byte_swap),
+        .bit_reverse => return bitBuiltin(gz, scope, rl, node, params[0], .bit_reverse),
 
         .div_exact => return divBuiltin(gz, scope, rl, node, params[0], params[1], .div_exact),
         .div_floor => return divBuiltin(gz, scope, rl, node, params[0], params[1], .div_floor),
@@ -7742,8 +7815,8 @@ fn builtinCall(
         .c_undef   => return simpleCBuiltin(gz, scope, rl, node, params[0], .c_undef),
         .c_include => return simpleCBuiltin(gz, scope, rl, node, params[0], .c_include),
 
-        .cmpxchg_strong => return cmpxchg(gz, scope, rl, node, params, .cmpxchg_strong),
-        .cmpxchg_weak   => return cmpxchg(gz, scope, rl, node, params, .cmpxchg_weak),
+        .cmpxchg_strong => return cmpxchg(gz, scope, rl, node, params, 1),
+        .cmpxchg_weak   => return cmpxchg(gz, scope, rl, node, params, 0),
         // zig fmt: on
 
         .wasm_memory_size => {
@@ -7940,7 +8013,8 @@ fn builtinCall(
             return rvalue(gz, rl, result, node);
         },
         .async_call => {
-            const result = try gz.addPlNode(.builtin_async_call, node, Zir.Inst.AsyncCall{
+            const result = try gz.addExtendedPayload(.builtin_async_call, Zir.Inst.AsyncCall{
+                .node = gz.nodeIndexToRelative(node),
                 .frame_buffer = try expr(gz, scope, .none, params[0]),
                 .result_ptr = try expr(gz, scope, .none, params[1]),
                 .fn_ptr = try expr(gz, scope, .none, params[2]),
@@ -8053,8 +8127,8 @@ fn negation(
     // Check for float literal as the sub-expression because we want to preserve
     // its negativity rather than having it go through comptime subtraction.
     const operand_node = node_datas[node].lhs;
-    if (node_tags[operand_node] == .float_literal) {
-        return floatLiteral(gz, rl, operand_node, .negative);
+    if (node_tags[operand_node] == .number_literal) {
+        return numberLiteral(gz, rl, operand_node, node, .negative);
     }
 
     const operand = try expr(gz, scope, .none, operand_node);
@@ -8068,11 +8142,12 @@ fn cmpxchg(
     rl: ResultLoc,
     node: Ast.Node.Index,
     params: []const Ast.Node.Index,
-    tag: Zir.Inst.Tag,
+    small: u16,
 ) InnerError!Zir.Inst.Ref {
     const int_type = try typeExpr(gz, scope, params[0]);
-    const result = try gz.addPlNode(tag, node, Zir.Inst.Cmpxchg{
+    const result = try gz.addExtendedPayloadSmall(.cmpxchg, small, Zir.Inst.Cmpxchg{
         // zig fmt: off
+        .node           = gz.nodeIndexToRelative(node),
         .ptr            = try expr(gz, scope, .none,                                 params[1]),
         .expected_value = try expr(gz, scope, .{ .ty = int_type },                   params[2]),
         .new_value      = try expr(gz, scope, .{ .coerced_ty = int_type },           params[3]),
@@ -8088,17 +8163,9 @@ fn bitBuiltin(
     scope: *Scope,
     rl: ResultLoc,
     node: Ast.Node.Index,
-    int_type_node: Ast.Node.Index,
     operand_node: Ast.Node.Index,
     tag: Zir.Inst.Tag,
 ) InnerError!Zir.Inst.Ref {
-    // The accepted proposal https://github.com/ziglang/zig/issues/6835
-    // tells us to remove the type parameter from these builtins. To stay
-    // source-compatible with stage1, we still observe the parameter here,
-    // but we do not encode it into the ZIR. To implement this proposal in
-    // stage2, only AstGen code will need to be changed.
-    _ = try typeExpr(gz, scope, int_type_node);
-
     const operand = try expr(gz, scope, .none, operand_node);
     const result = try gz.addUnNode(tag, operand, node);
     return rvalue(gz, rl, result, node);
@@ -8167,7 +8234,7 @@ fn shiftOp(
 ) InnerError!Zir.Inst.Ref {
     const lhs = try expr(gz, scope, .none, lhs_node);
     const log2_int_type = try gz.addUnNode(.typeof_log2_int_type, lhs, lhs_node);
-    const rhs = try expr(gz, scope, .{ .ty = log2_int_type }, rhs_node);
+    const rhs = try expr(gz, scope, .{ .ty_shift_operand = log2_int_type }, rhs_node);
     const result = try gz.addPlNode(tag, node, Zir.Inst.Bin{
         .lhs = lhs,
         .rhs = rhs,
@@ -8432,7 +8499,9 @@ fn nodeMayNeedMemoryLocation(tree: *const Ast, start_node: Ast.Node.Index, have_
             .@"usingnamespace",
             .test_decl,
             .switch_case,
+            .switch_case_inline,
             .switch_case_one,
+            .switch_case_inline_one,
             .container_field_init,
             .container_field_align,
             .container_field,
@@ -8470,8 +8539,7 @@ fn nodeMayNeedMemoryLocation(tree: *const Ast, start_node: Ast.Node.Index, have_
             .fn_decl,
             .anyframe_type,
             .anyframe_literal,
-            .integer_literal,
-            .float_literal,
+            .number_literal,
             .enum_literal,
             .string_literal,
             .multiline_string_literal,
@@ -8665,7 +8733,9 @@ fn nodeMayEvalToError(tree: *const Ast, start_node: Ast.Node.Index) BuiltinFn.Ev
             .@"usingnamespace",
             .test_decl,
             .switch_case,
+            .switch_case_inline,
             .switch_case_one,
+            .switch_case_inline_one,
             .container_field_init,
             .container_field_align,
             .container_field,
@@ -8730,8 +8800,7 @@ fn nodeMayEvalToError(tree: *const Ast, start_node: Ast.Node.Index) BuiltinFn.Ev
             .fn_decl,
             .anyframe_type,
             .anyframe_literal,
-            .integer_literal,
-            .float_literal,
+            .number_literal,
             .enum_literal,
             .string_literal,
             .multiline_string_literal,
@@ -8877,7 +8946,9 @@ fn nodeImpliesMoreThanOnePossibleValue(tree: *const Ast, start_node: Ast.Node.In
             .@"usingnamespace",
             .test_decl,
             .switch_case,
+            .switch_case_inline,
             .switch_case_one,
+            .switch_case_inline_one,
             .container_field_init,
             .container_field_align,
             .container_field,
@@ -8904,8 +8975,7 @@ fn nodeImpliesMoreThanOnePossibleValue(tree: *const Ast, start_node: Ast.Node.In
             .@"suspend",
             .fn_decl,
             .anyframe_literal,
-            .integer_literal,
-            .float_literal,
+            .number_literal,
             .enum_literal,
             .string_literal,
             .multiline_string_literal,
@@ -9120,7 +9190,9 @@ fn nodeImpliesComptimeOnly(tree: *const Ast, start_node: Ast.Node.Index) bool {
             .@"usingnamespace",
             .test_decl,
             .switch_case,
+            .switch_case_inline,
             .switch_case_one,
+            .switch_case_inline_one,
             .container_field_init,
             .container_field_align,
             .container_field,
@@ -9147,8 +9219,7 @@ fn nodeImpliesComptimeOnly(tree: *const Ast, start_node: Ast.Node.Index) bool {
             .@"suspend",
             .fn_decl,
             .anyframe_literal,
-            .integer_literal,
-            .float_literal,
+            .number_literal,
             .enum_literal,
             .string_literal,
             .multiline_string_literal,
@@ -9350,6 +9421,32 @@ fn nodeImpliesComptimeOnly(tree: *const Ast, start_node: Ast.Node.Index) bool {
     }
 }
 
+/// Returns `true` if the node uses `gz.anon_name_strategy`.
+fn nodeUsesAnonNameStrategy(tree: *const Ast, node: Ast.Node.Index) bool {
+    const node_tags = tree.nodes.items(.tag);
+    switch (node_tags[node]) {
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => return true,
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            const builtin_token = tree.nodes.items(.main_token)[node];
+            const builtin_name = tree.tokenSlice(builtin_token);
+            return std.mem.eql(u8, builtin_name, "@Type");
+        },
+        else => return false,
+    }
+}
+
 /// Applies `rl` semantics to `result`. Expressions which do not do their own handling of
 /// result locations must call this function on their result.
 /// As an example, if the `ResultLoc` is `ptr`, it will write the result to the pointer.
@@ -9398,7 +9495,7 @@ fn rvalue(
             }
             return indexToRef(gop.value_ptr.*);
         },
-        .ty => |ty_inst| {
+        .ty, .ty_shift_operand => |ty_inst| {
             // Quickly eliminate some common, unnecessary type coercion.
             const as_ty = @as(u64, @enumToInt(Zir.Inst.Ref.type_type)) << 32;
             const as_comptime_int = @as(u64, @enumToInt(Zir.Inst.Ref.comptime_int_type)) << 32;
@@ -9459,32 +9556,26 @@ fn rvalue(
                 => return result, // type of result is already correct
 
                 // Need an explicit type coercion instruction.
-                else => return gz.addPlNode(.as_node, src_node, Zir.Inst.As{
+                else => return gz.addPlNode(rl.zirTag(), src_node, Zir.Inst.As{
                     .dest_type = ty_inst,
                     .operand = result,
                 }),
             }
         },
         .ptr => |ptr_inst| {
-            if (gz.rvalue_noresult != ptr_inst) {
-                _ = try gz.addPlNode(.store_node, src_node, Zir.Inst.Bin{
-                    .lhs = ptr_inst,
-                    .rhs = result,
-                });
-            }
+            _ = try gz.addPlNode(.store_node, src_node, Zir.Inst.Bin{
+                .lhs = ptr_inst,
+                .rhs = result,
+            });
             return result;
         },
         .inferred_ptr => |alloc| {
-            if (gz.rvalue_noresult != alloc) {
-                _ = try gz.addBin(.store_to_inferred_ptr, alloc, result);
-            }
+            _ = try gz.addBin(.store_to_inferred_ptr, alloc, result);
             return result;
         },
         .block_ptr => |block_scope| {
-            if (gz.rvalue_noresult != block_scope.rl_ptr) {
-                block_scope.rvalue_rl_count += 1;
-                _ = try gz.addBin(.store_to_block_ptr, block_scope.rl_ptr, result);
-            }
+            block_scope.rvalue_rl_count += 1;
+            _ = try gz.addBin(.store_to_block_ptr, block_scope.rl_ptr, result);
             return result;
         },
     }
@@ -10024,7 +10115,6 @@ const Scope = struct {
         local_ptr,
         defer_normal,
         defer_error,
-        defer_gen,
         namespace,
         top,
     };
@@ -10035,6 +10125,7 @@ const Scope = struct {
         @"local constant",
         @"local variable",
         @"loop index capture",
+        @"switch tag capture",
         @"capture",
     };
 
@@ -10050,11 +10141,15 @@ const Scope = struct {
         inst: Zir.Inst.Ref,
         /// Source location of the corresponding variable declaration.
         token_src: Ast.TokenIndex,
+        /// Track the first identifer where it is referenced.
+        /// 0 means never referenced.
+        used: Ast.TokenIndex = 0,
+        /// Track the identifier where it is discarded, like this `_ = foo;`.
+        /// 0 means never discarded.
+        discarded: Ast.TokenIndex = 0,
         /// String table index.
         name: u32,
         id_cat: IdCat,
-        /// Track whether the name has been referenced.
-        used: bool = false,
     };
 
     /// This could be a `const` or `var` local. It has a pointer instead of a value.
@@ -10069,24 +10164,27 @@ const Scope = struct {
         ptr: Zir.Inst.Ref,
         /// Source location of the corresponding variable declaration.
         token_src: Ast.TokenIndex,
+        /// Track the first identifer where it is referenced.
+        /// 0 means never referenced.
+        used: Ast.TokenIndex = 0,
+        /// Track the identifier where it is discarded, like this `_ = foo;`.
+        /// 0 means never discarded.
+        discarded: Ast.TokenIndex = 0,
         /// String table index.
         name: u32,
         id_cat: IdCat,
         /// true means we find out during Sema whether the value is comptime.
         /// false means it is already known at AstGen the value is runtime-known.
         maybe_comptime: bool,
-        /// Track whether the name has been referenced.
-        used: bool = false,
     };
 
     const Defer = struct {
         base: Scope,
         /// Parents can be: `LocalVal`, `LocalPtr`, `GenZir`, `Defer`, `Namespace`.
         parent: *Scope,
-        defer_node: Ast.Node.Index,
-        source_offset: u32,
-        source_line: u32,
-        source_column: u32,
+        index: u32,
+        len: u32,
+        remapped_err_code: Zir.Inst.Index = 0,
     };
 
     /// Represents a global scope that has any number of declarations in it.
@@ -10122,13 +10220,6 @@ const Scope = struct {
         const base_tag: Scope.Tag = .top;
         base: Scope = Scope{ .tag = base_tag },
     };
-
-    const DeferGen = struct {
-        const base_tag: Scope.Tag = .defer_gen;
-        base: Scope = Scope{ .tag = base_tag },
-        parent: *Scope,
-        defer_node: Ast.Node.Index,
-    };
 };
 
 /// This is a temporary structure; references to it are valid only
@@ -10139,7 +10230,6 @@ const GenZir = struct {
     force_comptime: bool,
     /// This is set to true for inline loops; false otherwise.
     is_inline: bool = false,
-    in_defer: bool,
     c_import: bool = false,
     /// How decls created in this scope should be named.
     anon_name_strategy: Zir.Inst.NameStrategy = .anon,
@@ -10166,7 +10256,6 @@ const GenZir = struct {
     rl_ptr: Zir.Inst.Ref = .none,
     /// When a block has a type result location, here it is.
     rl_ty_inst: Zir.Inst.Ref = .none,
-    rvalue_noresult: Zir.Inst.Ref = .none,
     /// Keeps track of how many branches of a block did not actually
     /// consume the result location. astgen uses this to figure out
     /// whether to rely on break instructions or writing to the result
@@ -10182,6 +10271,10 @@ const GenZir = struct {
 
     suspend_node: Ast.Node.Index = 0,
     nosuspend_node: Ast.Node.Index = 0,
+    /// Set if this GenZir is a defer.
+    cur_defer_node: Ast.Node.Index = 0,
+    // Set if this GenZir is a defer or it is inside a defer.
+    any_defer_node: Ast.Node.Index = 0,
 
     /// Namespace members are lazy.  When executing a decl within a namespace,
     /// any references to external instructions need to be treated specially.
@@ -10222,7 +10315,6 @@ const GenZir = struct {
     fn makeSubBlock(gz: *GenZir, scope: *Scope) GenZir {
         return .{
             .force_comptime = gz.force_comptime,
-            .in_defer = gz.in_defer,
             .c_import = gz.c_import,
             .decl_node_index = gz.decl_node_index,
             .decl_line = gz.decl_line,
@@ -10231,6 +10323,7 @@ const GenZir = struct {
             .astgen = gz.astgen,
             .suspend_node = gz.suspend_node,
             .nosuspend_node = gz.nosuspend_node,
+            .any_defer_node = gz.any_defer_node,
             .instructions = gz.instructions,
             .instructions_top = gz.instructions.items.len,
         };
@@ -10339,7 +10432,7 @@ const GenZir = struct {
         // we emit ZIR for the block break instructions to have the result values,
         // and then rvalue() on that to pass the value to the result location.
         switch (parent_rl) {
-            .ty, .coerced_ty => |ty_inst| {
+            .ty, .ty_shift_operand, .coerced_ty => |ty_inst| {
                 gz.rl_ty_inst = ty_inst;
                 gz.break_result_loc = parent_rl;
             },
@@ -10902,9 +10995,14 @@ const GenZir = struct {
         return new_index;
     }
 
-    fn addExtendedPayload(
+    fn addExtendedPayload(gz: *GenZir, opcode: Zir.Inst.Extended, extra: anytype) !Zir.Inst.Ref {
+        return addExtendedPayloadSmall(gz, opcode, undefined, extra);
+    }
+
+    fn addExtendedPayloadSmall(
         gz: *GenZir,
         opcode: Zir.Inst.Extended,
+        small: u16,
         extra: anytype,
     ) !Zir.Inst.Ref {
         const gpa = gz.astgen.gpa;
@@ -10918,7 +11016,7 @@ const GenZir = struct {
             .tag = .extended,
             .data = .{ .extended = .{
                 .opcode = opcode,
-                .small = undefined,
+                .small = small,
                 .operand = payload_index,
             } },
         });
@@ -11081,6 +11179,16 @@ const GenZir = struct {
             .data = .{ .bin = .{
                 .lhs = lhs,
                 .rhs = rhs,
+            } },
+        });
+    }
+
+    fn addDefer(gz: *GenZir, index: u32, len: u32) !void {
+        _ = try gz.add(.{
+            .tag = .@"defer",
+            .data = .{ .@"defer" = .{
+                .index = index,
+                .len = len,
             } },
         });
     }
@@ -11495,7 +11603,7 @@ const GenZir = struct {
     fn addRet(gz: *GenZir, rl: ResultLoc, operand: Zir.Inst.Ref, node: Ast.Node.Index) !void {
         switch (rl) {
             .ptr => |ret_ptr| _ = try gz.addUnNode(.ret_load, ret_ptr, node),
-            .ty => _ = try gz.addUnNode(.ret_node, operand, node),
+            .ty, .ty_shift_operand => _ = try gz.addUnNode(.ret_node, operand, node),
             else => unreachable,
         }
     }
@@ -11542,17 +11650,6 @@ const GenZir = struct {
         try gz.astgen.instructions.append(gpa, .{ .tag = .dbg_block_end, .data = undefined });
         try gz.instructions.insert(gpa, gz.instructions.items.len - 1, new_index);
     }
-
-    /// Control flow does not fall through the "then" block of a loop; it continues
-    /// back to the while condition. This prevents `rvalue` from
-    /// adding an invalid store to the result location of `then_scope`.
-    fn markAsLoopBody(gz: *GenZir, loop_scope: GenZir) void {
-        gz.rvalue_noresult = switch (loop_scope.break_result_loc) {
-            .ptr, .inferred_ptr => |ptr| ptr,
-            .block_ptr => |block| block.rl_ptr,
-            else => .none,
-        };
-    }
 };
 
 /// This can only be for short-lived references; the memory becomes invalidated
@@ -11581,6 +11678,7 @@ fn detectLocalShadowing(
     ident_name: u32,
     name_token: Ast.TokenIndex,
     token_bytes: []const u8,
+    id_cat: Scope.IdCat,
 ) !void {
     const gpa = astgen.gpa;
     if (token_bytes[0] != '@' and isPrimitive(token_bytes)) {
@@ -11594,6 +11692,7 @@ fn detectLocalShadowing(
     }
 
     var s = scope;
+    var outer_scope = false;
     while (true) switch (s.tag) {
         .local_val => {
             const local_val = s.cast(Scope.LocalVal).?;
@@ -11601,6 +11700,17 @@ fn detectLocalShadowing(
                 const name_slice = mem.span(astgen.nullTerminatedString(ident_name));
                 const name = try gpa.dupe(u8, name_slice);
                 defer gpa.free(name);
+                if (outer_scope) {
+                    return astgen.failTokNotes(name_token, "{s} '{s}' shadows {s} from outer scope", .{
+                        @tagName(id_cat), name, @tagName(local_val.id_cat),
+                    }, &[_]u32{
+                        try astgen.errNoteTok(
+                            local_val.token_src,
+                            "previous declaration here",
+                            .{},
+                        ),
+                    });
+                }
                 return astgen.failTokNotes(name_token, "redeclaration of {s} '{s}'", .{
                     @tagName(local_val.id_cat), name,
                 }, &[_]u32{
@@ -11619,6 +11729,17 @@ fn detectLocalShadowing(
                 const name_slice = mem.span(astgen.nullTerminatedString(ident_name));
                 const name = try gpa.dupe(u8, name_slice);
                 defer gpa.free(name);
+                if (outer_scope) {
+                    return astgen.failTokNotes(name_token, "{s} '{s}' shadows {s} from outer scope", .{
+                        @tagName(id_cat), name, @tagName(local_ptr.id_cat),
+                    }, &[_]u32{
+                        try astgen.errNoteTok(
+                            local_ptr.token_src,
+                            "previous declaration here",
+                            .{},
+                        ),
+                    });
+                }
                 return astgen.failTokNotes(name_token, "redeclaration of {s} '{s}'", .{
                     @tagName(local_ptr.id_cat), name,
                 }, &[_]u32{
@@ -11632,6 +11753,7 @@ fn detectLocalShadowing(
             s = local_ptr.parent;
         },
         .namespace => {
+            outer_scope = true;
             const ns = s.cast(Scope.Namespace).?;
             const decl_node = ns.decls.get(ident_name) orelse {
                 s = ns.parent;
@@ -11640,15 +11762,17 @@ fn detectLocalShadowing(
             const name_slice = mem.span(astgen.nullTerminatedString(ident_name));
             const name = try gpa.dupe(u8, name_slice);
             defer gpa.free(name);
-            return astgen.failTokNotes(name_token, "local shadows declaration of '{s}'", .{
-                name,
+            return astgen.failTokNotes(name_token, "{s} shadows declaration of '{s}'", .{
+                @tagName(id_cat), name,
             }, &[_]u32{
                 try astgen.errNoteNode(decl_node, "declared here", .{}),
             });
         },
-        .gen_zir => s = s.cast(GenZir).?.parent,
+        .gen_zir => {
+            s = s.cast(GenZir).?.parent;
+            outer_scope = true;
+        },
         .defer_normal, .defer_error => s = s.cast(Scope.Defer).?.parent,
-        .defer_gen => s = s.cast(Scope.DeferGen).?.parent,
         .top => break,
     };
 }
@@ -11752,14 +11876,13 @@ fn scanDecls(astgen: *AstGen, namespace: *Scope.Namespace, members: []const Ast.
             }
         }
 
-        // const index_name = try astgen.identAsString(index_token);
         var s = namespace.parent;
         while (true) switch (s.tag) {
             .local_val => {
                 const local_val = s.cast(Scope.LocalVal).?;
                 if (local_val.name == name_str_index) {
-                    return astgen.failTokNotes(name_token, "redeclaration of {s} '{s}'", .{
-                        @tagName(local_val.id_cat), token_bytes,
+                    return astgen.failTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
+                        token_bytes, @tagName(local_val.id_cat),
                     }, &[_]u32{
                         try astgen.errNoteTok(
                             local_val.token_src,
@@ -11773,8 +11896,8 @@ fn scanDecls(astgen: *AstGen, namespace: *Scope.Namespace, members: []const Ast.
             .local_ptr => {
                 const local_ptr = s.cast(Scope.LocalPtr).?;
                 if (local_ptr.name == name_str_index) {
-                    return astgen.failTokNotes(name_token, "redeclaration of {s} '{s}'", .{
-                        @tagName(local_ptr.id_cat), token_bytes,
+                    return astgen.failTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
+                        token_bytes, @tagName(local_ptr.id_cat),
                     }, &[_]u32{
                         try astgen.errNoteTok(
                             local_ptr.token_src,
@@ -11788,7 +11911,6 @@ fn scanDecls(astgen: *AstGen, namespace: *Scope.Namespace, members: []const Ast.
             .namespace => s = s.cast(Scope.Namespace).?.parent,
             .gen_zir => s = s.cast(GenZir).?.parent,
             .defer_normal, .defer_error => s = s.cast(Scope.Defer).?.parent,
-            .defer_gen => s = s.cast(Scope.DeferGen).?.parent,
             .top => break,
         };
         gop.value_ptr.* = member_node;

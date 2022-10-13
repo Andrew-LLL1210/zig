@@ -162,6 +162,7 @@ const Writer = struct {
             .load,
             .ensure_result_used,
             .ensure_result_non_error,
+            .ensure_err_union_payload_void,
             .ret_node,
             .ret_load,
             .resolve_inferred_alloc,
@@ -170,9 +171,7 @@ const Writer = struct {
             .optional_payload_unsafe,
             .optional_payload_safe_ptr,
             .optional_payload_unsafe_ptr,
-            .err_union_payload_safe,
             .err_union_payload_unsafe,
-            .err_union_payload_safe_ptr,
             .err_union_payload_unsafe_ptr,
             .err_union_code,
             .err_union_code_ptr,
@@ -232,12 +231,13 @@ const Writer = struct {
             .make_ptr_const,
             .validate_deref,
             .overflow_arithmetic_ptr,
+            .check_comptime_control_flow,
             => try self.writeUnNode(stream, inst),
 
             .ref,
             .ret_tok,
-            .ensure_err_payload_void,
             .closure_capture,
+            .switch_capture_tag,
             => try self.writeUnTok(stream, inst),
 
             .bool_br_and,
@@ -273,7 +273,6 @@ const Writer = struct {
             .struct_init_ref,
             => try self.writeStructInit(stream, inst),
 
-            .cmpxchg_strong, .cmpxchg_weak => try self.writeCmpxchg(stream, inst),
             .atomic_load => try self.writeAtomicLoad(stream, inst),
             .atomic_store => try self.writeAtomicStore(stream, inst),
             .atomic_rmw => try self.writeAtomicRmw(stream, inst),
@@ -283,7 +282,6 @@ const Writer = struct {
             .mul_add => try self.writeMulAdd(stream, inst),
             .field_parent_ptr => try self.writeFieldParentPtr(stream, inst),
             .builtin_call => try self.writeBuiltinCall(stream, inst),
-            .builtin_async_call => try self.writeBuiltinAsyncCall(stream, inst),
 
             .struct_init_anon,
             .struct_init_anon_ref,
@@ -397,7 +395,7 @@ const Writer = struct {
             .field_val_named,
             => try self.writePlNodeFieldNamed(stream, inst),
 
-            .as_node => try self.writeAs(stream, inst),
+            .as_node, .as_shift_operand => try self.writeAs(stream, inst),
 
             .repeat,
             .repeat_inline,
@@ -407,7 +405,6 @@ const Writer = struct {
             .alloc_inferred_comptime_mut,
             .ret_ptr,
             .ret_type,
-            .check_comptime_control_flow,
             => try self.writeNode(stream, inst),
 
             .error_value,
@@ -446,6 +443,9 @@ const Writer = struct {
             => try stream.writeAll("))"),
 
             .closure_get => try self.writeInstNode(stream, inst),
+
+            .@"defer" => try self.writeDefer(stream, inst),
+            .defer_err_code => try self.writeDeferErrCode(stream, inst),
 
             .extended => try self.writeExtended(stream, inst),
         }
@@ -531,6 +531,8 @@ const Writer = struct {
                 try stream.writeAll(") ");
                 try self.writeSrc(stream, src);
             },
+            .builtin_async_call => try self.writeBuiltinAsyncCall(stream, extended),
+            .cmpxchg => try self.writeCmpxchg(stream, extended),
         }
     }
 
@@ -814,9 +816,8 @@ const Writer = struct {
         try self.writeSrc(stream, inst_data.src());
     }
 
-    fn writeBuiltinAsyncCall(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
-        const inst_data = self.code.instructions.items(.data)[inst].pl_node;
-        const extra = self.code.extraData(Zir.Inst.AsyncCall, inst_data.payload_index).data;
+    fn writeBuiltinAsyncCall(self: *Writer, stream: anytype, extended: Zir.Inst.Extended.InstData) !void {
+        const extra = self.code.extraData(Zir.Inst.AsyncCall, extended.operand).data;
         try self.writeInstRef(stream, extra.frame_buffer);
         try stream.writeAll(", ");
         try self.writeInstRef(stream, extra.result_ptr);
@@ -825,7 +826,7 @@ const Writer = struct {
         try stream.writeAll(", ");
         try self.writeInstRef(stream, extra.args);
         try stream.writeAll(") ");
-        try self.writeSrc(stream, inst_data.src());
+        try self.writeSrc(stream, LazySrcLoc.nodeOffset(extra.node));
     }
 
     fn writeParam(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
@@ -912,9 +913,9 @@ const Writer = struct {
         try self.writeSrc(stream, inst_data.src());
     }
 
-    fn writeCmpxchg(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
-        const inst_data = self.code.instructions.items(.data)[inst].pl_node;
-        const extra = self.code.extraData(Zir.Inst.Cmpxchg, inst_data.payload_index).data;
+    fn writeCmpxchg(self: *Writer, stream: anytype, extended: Zir.Inst.Extended.InstData) !void {
+        const extra = self.code.extraData(Zir.Inst.Cmpxchg, extended.operand).data;
+        const src = LazySrcLoc.nodeOffset(extra.node);
 
         try self.writeInstRef(stream, extra.ptr);
         try stream.writeAll(", ");
@@ -926,7 +927,7 @@ const Writer = struct {
         try stream.writeAll(", ");
         try self.writeInstRef(stream, extra.failure_order);
         try stream.writeAll(") ");
-        try self.writeSrc(stream, inst_data.src());
+        try self.writeSrc(stream, src);
     }
 
     fn writeAtomicLoad(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
@@ -1443,7 +1444,7 @@ const Writer = struct {
         try self.writeFlag(stream, "autoenum, ", small.auto_enum_tag);
 
         if (decls_len == 0) {
-            try stream.writeAll("{}, ");
+            try stream.writeAll("{}");
         } else {
             const prev_parent_decl_node = self.parent_decl_node;
             if (src_node) |off| self.parent_decl_node = self.relativeToNodeIndex(off);
@@ -1454,15 +1455,20 @@ const Writer = struct {
             extra_index = try self.writeDecls(stream, decls_len, extra_index);
             self.indent -= 2;
             try stream.writeByteNTimes(' ', self.indent);
-            try stream.writeAll("}, ");
+            try stream.writeAll("}");
         }
-
-        assert(fields_len != 0);
 
         if (tag_type_ref != .none) {
-            try self.writeInstRef(stream, tag_type_ref);
             try stream.writeAll(", ");
+            try self.writeInstRef(stream, tag_type_ref);
         }
+
+        if (fields_len == 0) {
+            try stream.writeAll("})");
+            try self.writeSrcNode(stream, src_node);
+            return;
+        }
+        try stream.writeAll(", ");
 
         const body = self.code.extra[extra_index..][0..body_len];
         extra_index += body.len;
@@ -1716,13 +1722,13 @@ const Writer = struct {
         const body = self.code.extra[extra_index..][0..body_len];
         extra_index += body.len;
 
+        const prev_parent_decl_node = self.parent_decl_node;
+        if (src_node) |off| self.parent_decl_node = self.relativeToNodeIndex(off);
+        try self.writeBracedDecl(stream, body);
         if (fields_len == 0) {
-            assert(body.len == 0);
-            try stream.writeAll("{}, {})");
+            try stream.writeAll(", {})");
+            self.parent_decl_node = prev_parent_decl_node;
         } else {
-            const prev_parent_decl_node = self.parent_decl_node;
-            if (src_node) |off| self.parent_decl_node = self.relativeToNodeIndex(off);
-            try self.writeBracedDecl(stream, body);
             try stream.writeAll(", {\n");
 
             self.indent += 2;
@@ -1852,7 +1858,6 @@ const Writer = struct {
         } else 0;
 
         try self.writeInstRef(stream, extra.data.operand);
-        try self.writeFlag(stream, ", ref", extra.data.bits.is_ref);
 
         self.indent += 2;
 
@@ -1864,14 +1869,15 @@ const Writer = struct {
                 else => break :else_prong,
             };
 
-            const body_len = self.code.extra[extra_index];
+            const body_len = @truncate(u31, self.code.extra[extra_index]);
+            const inline_text = if (self.code.extra[extra_index] >> 31 != 0) "inline " else "";
             extra_index += 1;
             const body = self.code.extra[extra_index..][0..body_len];
             extra_index += body.len;
 
             try stream.writeAll(",\n");
             try stream.writeByteNTimes(' ', self.indent);
-            try stream.print("{s} => ", .{prong_name});
+            try stream.print("{s}{s} => ", .{ inline_text, prong_name });
             try self.writeBracedBody(stream, body);
         }
 
@@ -1881,13 +1887,15 @@ const Writer = struct {
             while (scalar_i < scalar_cases_len) : (scalar_i += 1) {
                 const item_ref = @intToEnum(Zir.Inst.Ref, self.code.extra[extra_index]);
                 extra_index += 1;
-                const body_len = self.code.extra[extra_index];
+                const body_len = @truncate(u31, self.code.extra[extra_index]);
+                const is_inline = self.code.extra[extra_index] >> 31 != 0;
                 extra_index += 1;
                 const body = self.code.extra[extra_index..][0..body_len];
                 extra_index += body_len;
 
                 try stream.writeAll(",\n");
                 try stream.writeByteNTimes(' ', self.indent);
+                if (is_inline) try stream.writeAll("inline ");
                 try self.writeInstRef(stream, item_ref);
                 try stream.writeAll(" => ");
                 try self.writeBracedBody(stream, body);
@@ -1900,13 +1908,15 @@ const Writer = struct {
                 extra_index += 1;
                 const ranges_len = self.code.extra[extra_index];
                 extra_index += 1;
-                const body_len = self.code.extra[extra_index];
+                const body_len = @truncate(u31, self.code.extra[extra_index]);
+                const is_inline = self.code.extra[extra_index] >> 31 != 0;
                 extra_index += 1;
                 const items = self.code.refSlice(extra_index, items_len);
                 extra_index += items_len;
 
                 try stream.writeAll(",\n");
                 try stream.writeByteNTimes(' ', self.indent);
+                if (is_inline) try stream.writeAll("inline ");
 
                 for (items) |item_ref, item_i| {
                     if (item_i != 0) try stream.writeAll(", ");
@@ -2358,6 +2368,26 @@ const Writer = struct {
     fn writeDbgStmt(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
         const inst_data = self.code.instructions.items(.data)[inst].dbg_stmt;
         try stream.print("{d}, {d})", .{ inst_data.line + 1, inst_data.column + 1 });
+    }
+
+    fn writeDefer(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
+        const inst_data = self.code.instructions.items(.data)[inst].@"defer";
+        const body = self.code.extra[inst_data.index..][0..inst_data.len];
+        try self.writeBracedBody(stream, body);
+        try stream.writeByte(')');
+    }
+
+    fn writeDeferErrCode(self: *Writer, stream: anytype, inst: Zir.Inst.Index) !void {
+        const inst_data = self.code.instructions.items(.data)[inst].defer_err_code;
+        const extra = self.code.extraData(Zir.Inst.DeferErrCode, inst_data.payload_index).data;
+
+        try self.writeInstRef(stream, Zir.indexToRef(extra.remapped_err_code));
+        try stream.writeAll(" = ");
+        try self.writeInstRef(stream, inst_data.err_code);
+        try stream.writeAll(", ");
+        const body = self.code.extra[extra.index..][0..extra.len];
+        try self.writeBracedBody(stream, body);
+        try stream.writeByte(')');
     }
 
     fn writeInstRef(self: *Writer, stream: anytype, ref: Zir.Inst.Ref) !void {

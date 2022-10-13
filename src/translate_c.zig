@@ -436,7 +436,25 @@ pub fn translate(
         }
     }
 
-    return ast.render(gpa, context.global_scope.nodes.items);
+    return ast.render(gpa, zig_is_stage1, context.global_scope.nodes.items);
+}
+
+/// Determines whether macro is of the form: `#define FOO FOO` (Possibly with trailing tokens)
+/// Macros of this form will not be translated.
+fn isSelfDefinedMacro(unit: *const clang.ASTUnit, c: *const Context, macro: *const clang.MacroDefinitionRecord) bool {
+    const source = getMacroText(unit, c, macro);
+    var tokenizer = std.c.Tokenizer{
+        .buffer = source,
+    };
+    const name_tok = tokenizer.next();
+    const name = source[name_tok.start..name_tok.end];
+
+    const first_tok = tokenizer.next();
+    // We do not just check for `.Identifier` below because keyword tokens are preferentially matched first by
+    // the tokenizer.
+    // In other words we would miss `#define inline inline` (`inline` is a valid c89 identifier)
+    if (first_tok.id == .Eof) return false;
+    return mem.eql(u8, name, source[first_tok.start..first_tok.end]);
 }
 
 fn prepopulateGlobalNameTable(ast_unit: *clang.ASTUnit, c: *Context) !void {
@@ -455,7 +473,10 @@ fn prepopulateGlobalNameTable(ast_unit: *clang.ASTUnit, c: *Context) !void {
                 const macro = @ptrCast(*clang.MacroDefinitionRecord, entity);
                 const raw_name = macro.getName_getNameStart();
                 const name = try c.str(raw_name);
-                try c.global_names.put(c.gpa, name, {});
+
+                if (!isSelfDefinedMacro(ast_unit, c, macro)) {
+                    try c.global_names.put(c.gpa, name, {});
+                }
             },
             else => {},
         }
@@ -857,7 +878,7 @@ fn visitVarDecl(c: *Context, var_decl: *const clang.VarDecl, mangled_name: ?[]co
         .is_export = is_export,
         .is_threadlocal = is_threadlocal,
         .linksection_string = linksection_string,
-        .alignment = zigAlignment(var_decl.getAlignedAttribute(c.clang_context)),
+        .alignment = ClangAlignment.forVar(c, var_decl).zigAlignment(),
         .name = var_name,
         .type = type_node,
         .init = init_node,
@@ -1075,7 +1096,6 @@ fn transRecordDecl(c: *Context, scope: *Scope, record_decl: *const clang.RecordD
             break :blk Tag.opaque_literal.init();
         };
 
-        const is_packed = record_decl.getPackedAttribute();
         var fields = std.ArrayList(ast.Payload.Record.Field).init(c.gpa);
         defer fields.deinit();
 
@@ -1132,7 +1152,7 @@ fn transRecordDecl(c: *Context, scope: *Scope, record_decl: *const clang.RecordD
             const alignment = if (has_flexible_array and field_decl.getFieldIndex() == 0)
                 @intCast(c_uint, record_alignment)
             else
-                zigAlignment(field_decl.getAlignedAttribute(c.clang_context));
+                ClangAlignment.forField(c, field_decl, record_def).zigAlignment();
 
             if (is_anon) {
                 try c.decl_table.putNoClobber(c.gpa, @ptrToInt(field_decl.getCanonicalDecl()), field_name);
@@ -1149,7 +1169,7 @@ fn transRecordDecl(c: *Context, scope: *Scope, record_decl: *const clang.RecordD
         record_payload.* = .{
             .base = .{ .tag = ([2]Tag{ .@"struct", .@"union" })[@boolToInt(is_union)] },
             .data = .{
-                .layout = if (is_packed) .@"packed" else .@"extern",
+                .layout = .@"extern",
                 .fields = try c.arena.dupe(ast.Payload.Record.Field, fields.items),
                 .functions = try c.arena.dupe(Node, functions.items),
                 .variables = &.{},
@@ -1826,12 +1846,62 @@ fn transCStyleCastExprClass(
     return maybeSuppressResult(c, scope, result_used, cast_node);
 }
 
-/// Clang reports the alignment in bits, we use bytes
-/// Clang uses 0 for "no alignment specified", we use null
-fn zigAlignment(bit_alignment: c_uint) ?c_uint {
-    if (bit_alignment == 0) return null;
-    return bit_alignment / 8;
-}
+/// The alignment of a variable or field
+const ClangAlignment = struct {
+    /// Clang reports the alignment in bits, we use bytes
+    /// Clang uses 0 for "no alignment specified", we use null
+    bit_alignment: c_uint,
+    /// If the field or variable is marked as 'packed'
+    ///
+    /// According to the GCC variable attribute docs, this impacts alignment
+    /// https://gcc.gnu.org/onlinedocs/gcc/Common-Variable-Attributes.html
+    ///
+    /// > The packed attribute specifies that a structure member
+    /// > should have the smallest possible alignment
+    ///
+    /// Note also that specifying the 'packed' attribute on a structure
+    /// implicitly packs all its fields (making their alignment 1).
+    ///
+    /// This will be null if the AST node doesn't support packing (functions)
+    is_packed: ?bool,
+
+    /// Get the alignment for a field, optionally taking into account the parent record
+    pub fn forField(c: *const Context, field: *const clang.FieldDecl, parent: ?*const clang.RecordDecl) ClangAlignment {
+        const parent_packed = if (parent) |record| record.getPackedAttribute() else false;
+        // NOTE: According to GCC docs, parent attribute packed implies child attribute packed
+        return ClangAlignment{
+            .bit_alignment = field.getAlignedAttribute(c.clang_context),
+            .is_packed = field.getPackedAttribute() or parent_packed,
+        };
+    }
+
+    pub fn forVar(c: *const Context, var_decl: *const clang.VarDecl) ClangAlignment {
+        return ClangAlignment{
+            .bit_alignment = var_decl.getAlignedAttribute(c.clang_context),
+            .is_packed = var_decl.getPackedAttribute(),
+        };
+    }
+
+    pub fn forFunc(c: *const Context, fun: *const clang.FunctionDecl) ClangAlignment {
+        return ClangAlignment{
+            .bit_alignment = fun.getAlignedAttribute(c.clang_context),
+            .is_packed = null, // not supported by GCC/clang (or meaningful),
+        };
+    }
+
+    /// Translate the clang alignment info into a zig alignment
+    ///
+    /// Returns null if there is no special alignment info
+    pub fn zigAlignment(self: ClangAlignment) ?c_uint {
+        if (self.bit_alignment != 0) {
+            return self.bit_alignment / 8;
+        } else if (self.is_packed orelse false) {
+            return 1;
+        } else {
+            return null;
+        }
+    }
+};
 
 fn transDeclStmtOne(
     c: *Context,
@@ -1885,7 +1955,7 @@ fn transDeclStmtOne(
                 .is_export = false,
                 .is_threadlocal = var_decl.getTLSKind() != .None,
                 .linksection_string = null,
-                .alignment = zigAlignment(var_decl.getAlignedAttribute(c.clang_context)),
+                .alignment = ClangAlignment.forVar(c, var_decl).zigAlignment(),
                 .name = var_name,
                 .type = type_node,
                 .init = init_node,
@@ -2002,10 +2072,7 @@ fn transImplicitCastExpr(
         },
         .PointerToBoolean => {
             // @ptrToInt(val) != 0
-            var ptr_node = try transExpr(c, scope, sub_expr, .used);
-            if (ptr_node.tag() == .fn_identifier) {
-                ptr_node = try Tag.address_of.create(c.arena, ptr_node);
-            }
+            const ptr_node = try transExpr(c, scope, sub_expr, .used);
             const ptr_to_int = try Tag.ptr_to_int.create(c.arena, ptr_node);
 
             const ne = try Tag.not_equal.create(c.arena, .{ .lhs = ptr_to_int, .rhs = Tag.zero_literal.init() });
@@ -2454,10 +2521,7 @@ fn transCCast(
     }
     if (cIsInteger(dst_type) and qualTypeIsPtr(src_type)) {
         // @intCast(dest_type, @ptrToInt(val))
-        const ptr_to_int = if (expr.tag() == .fn_identifier)
-            try Tag.ptr_to_int.create(c.arena, try Tag.address_of.create(c.arena, expr))
-        else
-            try Tag.ptr_to_int.create(c.arena, expr);
+        const ptr_to_int = try Tag.ptr_to_int.create(c.arena, expr);
         return Tag.int_cast.create(c.arena, .{ .lhs = dst_node, .rhs = ptr_to_int });
     }
     if (cIsInteger(src_type) and qualTypeIsPtr(dst_type)) {
@@ -3496,7 +3560,8 @@ fn transArrayAccess(c: *Context, scope: *Scope, stmt: *const clang.ArraySubscrip
 
     // Special case: actual pointer (not decayed array) and signed integer subscript
     // See discussion at https://github.com/ziglang/zig/pull/8589
-    if (is_signed and (base_stmt == unwrapped_base) and !is_vector and !is_nonnegative_int_literal) return transSignedArrayAccess(c, scope, base_stmt, subscr_expr, result_used);
+    if (is_signed and (base_stmt == unwrapped_base) and !is_vector and !is_nonnegative_int_literal)
+        return transSignedArrayAccess(c, scope, base_stmt, subscr_expr, result_used);
 
     const container_node = try transExpr(c, scope, unwrapped_base, .used);
     const rhs = if (is_longlong or is_signed) blk: {
@@ -3691,9 +3756,6 @@ fn transUnaryOperator(c: *Context, scope: *Scope, stmt: *const clang.UnaryOperat
         else
             return transCreatePreCrement(c, scope, stmt, .sub_assign, used),
         .AddrOf => {
-            if (c.zig_is_stage1 and cIsFunctionDeclRef(op_expr)) {
-                return transExpr(c, scope, op_expr, used);
-            }
             return Tag.address_of.create(c.arena, try transExpr(c, scope, op_expr, used));
         },
         .Deref => {
@@ -5029,7 +5091,7 @@ fn finishTransFnProto(
         break :blk null;
     };
 
-    const alignment = if (fn_decl) |decl| zigAlignment(decl.getAlignedAttribute(c.clang_context)) else null;
+    const alignment = if (fn_decl) |decl| ClangAlignment.forFunc(c, decl).zigAlignment() else null;
 
     const explicit_callconv = if ((is_inline or is_export or is_extern) and cc == .C) null else cc;
 
@@ -5446,6 +5508,16 @@ fn tokenizeMacro(source: []const u8, tok_list: *std.ArrayList(CToken)) Error!voi
     }
 }
 
+fn getMacroText(unit: *const clang.ASTUnit, c: *const Context, macro: *const clang.MacroDefinitionRecord) []const u8 {
+    const begin_loc = macro.getSourceRange_getBegin();
+    const end_loc = clang.Lexer.getLocForEndOfToken(macro.getSourceRange_getEnd(), c.source_manager, unit);
+
+    const begin_c = c.source_manager.getCharacterData(begin_loc);
+    const end_c = c.source_manager.getCharacterData(end_loc);
+    const slice_len = @ptrToInt(end_c) - @ptrToInt(begin_c);
+    return begin_c[0..slice_len];
+}
+
 fn transPreprocessorEntities(c: *Context, unit: *clang.ASTUnit) Error!void {
     // TODO if we see #undef, delete it from the table
     var it = unit.getLocalPreprocessingEntities_begin();
@@ -5462,22 +5534,18 @@ fn transPreprocessorEntities(c: *Context, unit: *clang.ASTUnit) Error!void {
                 const macro = @ptrCast(*clang.MacroDefinitionRecord, entity);
                 const raw_name = macro.getName_getNameStart();
                 const begin_loc = macro.getSourceRange_getBegin();
-                const end_loc = clang.Lexer.getLocForEndOfToken(macro.getSourceRange_getEnd(), c.source_manager, unit);
 
                 const name = try c.str(raw_name);
                 if (scope.containsNow(name)) {
                     continue;
                 }
 
-                const begin_c = c.source_manager.getCharacterData(begin_loc);
-                const end_c = c.source_manager.getCharacterData(end_loc);
-                const slice_len = @ptrToInt(end_c) - @ptrToInt(begin_c);
-                const slice = begin_c[0..slice_len];
+                const source = getMacroText(unit, c, macro);
 
-                try tokenizeMacro(slice, &tok_list);
+                try tokenizeMacro(source, &tok_list);
 
                 var macro_ctx = MacroCtx{
-                    .source = slice,
+                    .source = source,
                     .list = tok_list.items,
                     .name = name,
                     .loc = begin_loc,
@@ -5490,7 +5558,8 @@ fn transPreprocessorEntities(c: *Context, unit: *clang.ASTUnit) Error!void {
                         // if it equals itself, ignore. for example, from stdio.h:
                         // #define stdin stdin
                         const tok = macro_ctx.list[1];
-                        if (mem.eql(u8, name, slice[tok.start..tok.end])) {
+                        if (mem.eql(u8, name, source[tok.start..tok.end])) {
+                            assert(!c.global_names.contains(source[tok.start..tok.end]));
                             continue;
                         }
                     },
@@ -5647,7 +5716,7 @@ fn parseCNumLit(c: *Context, m: *MacroCtx) ParseError!Node {
     switch (m.list[m.i].id) {
         .IntegerLiteral => |suffix| {
             var radix: []const u8 = "decimal";
-            if (lit_bytes.len > 2 and lit_bytes[0] == '0') {
+            if (lit_bytes.len >= 2 and lit_bytes[0] == '0') {
                 switch (lit_bytes[1]) {
                     '0'...'7' => {
                         // Octal
@@ -5767,7 +5836,7 @@ fn zigifyEscapeSequences(ctx: *Context, m: *MacroCtx) ![]const u8 {
         }
     }
     for (source) |c| {
-        if (c == '\\') {
+        if (c == '\\' or c == '\t') {
             break;
         }
     } else return source;
@@ -5844,6 +5913,13 @@ fn zigifyEscapeSequences(ctx: *Context, m: *MacroCtx) ![]const u8 {
                     state = .Start;
             },
             .Start => {
+                if (c == '\t') {
+                    bytes[i] = '\\';
+                    i += 1;
+                    bytes[i] = 't';
+                    i += 1;
+                    continue;
+                }
                 if (c == '\\') {
                     state = .Escape;
                 }
@@ -5918,20 +5994,36 @@ fn zigifyEscapeSequences(ctx: *Context, m: *MacroCtx) ![]const u8 {
     return bytes[0..i];
 }
 
+/// non-ASCII characters (c > 127) are also treated as non-printable by fmtSliceEscapeLower.
+/// If a C string literal or char literal in a macro is not valid UTF-8, we need to escape
+/// non-ASCII characters so that the Zig source we output will itself be UTF-8.
+fn escapeUnprintables(ctx: *Context, m: *MacroCtx) ![]const u8 {
+    const zigified = try zigifyEscapeSequences(ctx, m);
+    if (std.unicode.utf8ValidateSlice(zigified)) return zigified;
+
+    const formatter = std.fmt.fmtSliceEscapeLower(zigified);
+    const encoded_size = @intCast(usize, std.fmt.count("{s}", .{formatter}));
+    var output = try ctx.arena.alloc(u8, encoded_size);
+    return std.fmt.bufPrint(output, "{s}", .{formatter}) catch |err| switch (err) {
+        error.NoSpaceLeft => unreachable,
+        else => |e| return e,
+    };
+}
+
 fn parseCPrimaryExprInner(c: *Context, m: *MacroCtx, scope: *Scope) ParseError!Node {
     const tok = m.next().?;
     const slice = m.slice();
     switch (tok) {
         .CharLiteral => {
             if (slice[0] != '\'' or slice[1] == '\\' or slice.len == 3) {
-                return Tag.char_literal.create(c.arena, try zigifyEscapeSequences(c, m));
+                return Tag.char_literal.create(c.arena, try escapeUnprintables(c, m));
             } else {
                 const str = try std.fmt.allocPrint(c.arena, "0x{s}", .{std.fmt.fmtSliceHexLower(slice[1 .. slice.len - 1])});
                 return Tag.integer_literal.create(c.arena, str);
             }
         },
         .StringLiteral => {
-            return Tag.string_literal.create(c.arena, try zigifyEscapeSequences(c, m));
+            return Tag.string_literal.create(c.arena, try escapeUnprintables(c, m));
         },
         .IntegerLiteral, .FloatLiteral => {
             return parseCNumLit(c, m);
@@ -6404,7 +6496,11 @@ fn parseCPostfixExpr(c: *Context, m: *MacroCtx, scope: *Scope, type_name: ?Node)
                 node = try Tag.field_access.create(c.arena, .{ .lhs = deref, .field_name = m.slice() });
             },
             .LBracket => {
-                const index = try macroBoolToInt(c, try parseCExpr(c, m, scope));
+                const index_val = try macroBoolToInt(c, try parseCExpr(c, m, scope));
+                const index = try Tag.int_cast.create(c.arena, .{
+                    .lhs = try Tag.type.create(c.arena, "usize"),
+                    .rhs = index_val,
+                });
                 node = try Tag.array_access.create(c.arena, .{ .lhs = node, .rhs = index });
                 try m.skip(c, .RBracket);
             },
